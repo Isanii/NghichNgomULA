@@ -66448,6 +66448,7 @@ local components = (function()
                 return nil, err
             end
             firebase.controls = type(result) == "table" and result or {paused = false}
+            firebase.controlsEndpoint = firebase.db
             firebase.controlsAt = os.clock()
             firebase.controlsNextReadAt = 0
             firebase.controlsStatus = firebase.controls.paused and "Party paused by Carry" or "Party active"
@@ -66479,7 +66480,8 @@ local components = (function()
             firebase.controlsStatus = desired and "Sending Pause to Firebase..." or "Sending Resume to Firebase..."
             local ok, result, err = pcall(function()
                 return controlsRequest("PUT", httpService:JSONEncode({
-                    paused = desired, by = credential.uid, updatedAt = {[".sv"] = "timestamp"},
+                    paused = desired, by = credential.uid, job = game.JobId,
+                    updatedAt = {[".sv"] = "timestamp"},
                 }))
             end)
             firebase.controlsBusy = false
@@ -66497,6 +66499,7 @@ local components = (function()
                 return false, firebase.controlsStatus
             end
             firebase.controls = result
+            firebase.controlsEndpoint = firebase.db
             firebase.controlsAt = os.clock()
             firebase.controlsNextReadAt = 0
             firebase.controlsStatus = desired and "Party paused by Carry" or "Party resumed by Carry"
@@ -66652,8 +66655,14 @@ local components = (function()
             firebase.controlsAuthRetryAt = nil
             firebase.controlsBusy = false
             firebase.controlsEpoch = (firebase.controlsEpoch or 0) + 1
-            firebase.controls = {paused = false}
-            firebase.controlsStatus = "Reconnecting Cloud controls"
+            local nextControlsDb = tostring(config.firebaseDatabaseUrl or "")
+                :gsub("%s+", ""):gsub("/+$", "")
+            if firebase.controlsEndpoint and firebase.controlsEndpoint ~= nextControlsDb then
+                firebase.controls = {paused = false}
+            else
+                firebase.controls = firebase.controls or {paused = false}
+            end
+            firebase.controlsStatus = "Reconnecting Cloud controls (last confirmed state retained)"
             firebase.analyticsReadAt, firebase.analyticsWriteAt = nil, nil
             firebase.analyticsSignature, firebase.analyticsLastUpload = nil, nil
             firebase.analyticsMembers = {}
@@ -67590,6 +67599,15 @@ local components = (function()
         end
         context.queueLog = contextQueueLog
         local function contextReplayNow()
+            if lB.pauseReturnCommitted or
+                (context.PartyOps and context.PartyOps.paused()) then
+                lB.pauseReturnCommitted = true
+                h("Party paused - Replay cancelled; return to Lobby")
+                if context.MD and context.MD.goLobby then
+                    pcall(context.MD.goLobby)
+                end
+                return false
+            end
             -- Last-chance check: progress overrides Replay, including after a
             -- cross-PC level update that arrived later than the win signal.
             if context.AF and context.AF.progressReturnReason then
@@ -67789,6 +67807,25 @@ local components = (function()
             local farmEnabled = lB.place == "Level"
                 or lB.place == "100+"
                 or lB.place ~= "Lobby" and u ~= nil and u:IsA("StringValue") and u.Value ~= ""
+            -- The game's own Auto Replay may teleport a player without calling
+            -- our replayDungeon remote.  Cloud Pause records the old JobId.
+            -- If we are in a DIFFERENT Dungeon JobId, this is a new unwanted
+            -- run: leave it instead of farming during a paused Party.
+            local cloudControls = context.FirebaseSync and context.FirebaseSync.controls
+            local pausedNow = context.PartyOps and context.PartyOps.paused()
+            local pausedJob = pausedNow and cloudControls and cloudControls.job
+            if farmEnabled and type(pausedJob) == "string" and pausedJob ~= ""
+                and pausedJob ~= game.JobId then
+                lB.pauseReturnCommitted = true
+                h("Paused Party entered a new Dungeon via game Auto Replay; returning to Lobby")
+                if j - (lB.pauseReturnTryAt or -math.huge) >= 5
+                    and context.MD and context.MD.goLobby then
+                    lB.pauseReturnTryAt = j
+                    local accepted, reason = context.MD.goLobby()
+                    if not accepted then h("Paused - Lobby retry: " .. tostring(reason)) end
+                end
+                return
+            end
             if
                 config.autoFarmByPlace
                 and lB.place ~= lB.farmAppliedFor
@@ -67831,7 +67868,8 @@ local components = (function()
                     then context.AF.isHost() == true or context.AF.ownRun ~= nil and context.AF.ownRun() == true
                     else u
             end
-            if farmEnabled and u and not (context.MD and context.MD.halted) then
+            if farmEnabled and u and not (context.MD and context.MD.halted)
+                and not (lB.pauseReturnCommitted == true) then
                 lB.levelArrivedAt = lB.levelArrivedAt or j
                 local J, w = D("dungeonStarted"), context.RT and context.RT.preWalk
                 local Y, v, M, Z =
@@ -67930,6 +67968,8 @@ local components = (function()
                 lB.finishedSeenAt = nil
                 lB.runOverAt = nil
                 lB.forceProgressReturn = nil
+                lB.pauseReturnCommitted = nil
+                lB.pauseReturnTryAt = nil
                 lB.ptLeaveSince = nil
                 lB.rodinPhase = false
                 lB.rodinSeenAt = nil
@@ -68010,6 +68050,24 @@ local components = (function()
                     return
                 end
                 lB.runOverAt = lB.runOverAt or j
+                -- One authoritative decision for Pause-after-run.  Checking
+                -- this here (not only inside contextReplayNow) is essential:
+                -- the game's native Auto Replay does not use our replay call.
+                if (context.PartyOps and context.PartyOps.paused())
+                    or lB.pauseReturnCommitted then
+                    lB.pauseReturnCommitted = true
+                    lB.replayFired = false
+                    h("Party paused: Dungeon completed; returning to Lobby (no Replay)")
+                    if j - (lB.pauseReturnTryAt or -math.huge) >= 5
+                        and context.MD and context.MD.goLobby then
+                        lB.pauseReturnTryAt = j
+                        local accepted, reason = context.MD.goLobby()
+                        if not accepted then
+                            h("Party paused: Lobby retry - " .. tostring(reason))
+                        end
+                    end
+                    return
+                end
                 if context.MD and context.MD.pendingDrop then
                     h("run over - resting after a big drop, to the lobby")
                     return
@@ -70788,8 +70846,16 @@ local components = (function()
                 and fb.ownerUid ~= nil and fb.ownerUid == fb.uid
         end
         ops.paused = function()
-            return fb and fb.isCloudActive and fb.isCloudActive()
-                and fb.controls and fb.controls.paused == true or false
+            -- Last confirmed Cloud pause remains binding through a transient
+            -- Firebase disconnect; never automatically resume on network loss.
+            return fb ~= nil and fb.controls ~= nil and fb.controls.paused == true
+        end
+        ops.replayDecision = function()
+            if ops.paused() then return "paused: return to Lobby, no Replay" end
+            local selected = myParty()
+            if not selected or selected.on ~= true then return "no active Party" end
+            if selected.replay == false then return "Party Replay OFF: regroup in Lobby" end
+            return "Party Replay ON: repeat unless level progression changes"
         end
         ops.startBlockReason = function(missing, remaining)
             if config.opsSafety == false then return nil end
@@ -93360,6 +93426,8 @@ local components = (function()
                             "Party Health, Pause/Resume, Smart Recovery, Safe Start and Discord Party alerts.")
                         local live = uiKit.status(health.content,"Loading Party Health...",1)
                         local control = uiKit.status(health.content,"Cloud controls: connecting",2)
+                        local replayPolicy = uiKit.status(health.content,
+                            "Replay policy: waiting for Cloud Party", 10)
                         local action = uiKit.buttonRow(health.content,3)
                         action.add("Pause after run","plain",function()
                             control.Text = "Sending Pause..."
@@ -93425,6 +93493,7 @@ local components = (function()
                                 pcall(function()
                                     live.Text=ops.healthText()
                                     control.Text="Control: "..tostring(context.FirebaseSync and context.FirebaseSync.controlsStatus or "offline")
+                                    replayPolicy.Text="Replay: "..tostring(ops.replayDecision())
                                     recover.Text="Recovery: "..tostring(ops.recoveryStatus)
                                     alertView.Text="Alerts: "..(config.opsAlerts and tostring(ops.alertStatus) or "off")
                                     nextLevel.Text=ops.nextLevelText()
