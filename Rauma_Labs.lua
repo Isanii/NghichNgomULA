@@ -93192,11 +93192,14 @@ local components = (function()
                     )
                 )
                 contextRunsThisAccount.setOpen(true)
+                -- The five top-level categories remain Firebase, Parties, Dungeon, Options,
+                -- and Boss raids. Secondary party tools belong inside their parent category.
+                local dungeonSection = uiKit.section(g, "Dungeon", 3, "Which dungeon the leader queues.")
                 do
                     local ops = context.PartyOps
                     if ops then
-                        local health = uiKit.section(g,"Party Health & Controls",1,
-                            "Cross-PC heartbeat, Party status, and a Carry-only Cloud Pause/Resume.")
+                        local health = uiKit.section(contextRunsThisAccount.content,"Party Control & Safety",50,
+                            "Party Health, Pause/Resume, Smart Recovery, Safe Start and Discord Party alerts.")
                         local live = uiKit.status(health.content,"Loading Party Health...",1)
                         local control = uiKit.status(health.content,"Cloud controls: connecting",2)
                         local action = uiKit.buttonRow(health.content,3)
@@ -93212,32 +93215,30 @@ local components = (function()
                                 control.Text=ok and "Resumed: automatic queueing allowed" or tostring(msg)
                             end)
                         end,"Carry only: resume new Dungeon creation and Replay.")
-                        local safe = uiKit.section(g,"Recovery & Safe Start",2,
-                            "Auto rejoin assistance, configurable roster safety and offline alerts.")
-                        Y(uiKit.toggle(safe.content,"Smart Party Recovery",function()
+                        Y(uiKit.toggle(health.content,"Smart Party Recovery",function()
                             return config.opsRecovery~=false
                         end,function(value)
                             config.opsRecovery=value==true; contextSaveConfig()
-                        end,1,"Detect stalled Lobby joins and retry with cooldown. Requires Auto find and join Carry server."))
-                        Y(uiKit.toggle(safe.content,"Safe Start checks",function()
+                        end,4,"Detect stalled Lobby joins and retry with cooldown. Requires Auto find and join Carry server."))
+                        Y(uiKit.toggle(health.content,"Safe Start checks",function()
                             return config.opsSafety~=false
                         end,function(value)
                             config.opsSafety=value==true; contextSaveConfig()
-                        end,2,"Before automatic start, check Cloud status, Pause, and members who are loading or teleporting."))
-                        Y(uiKit.toggle(safe.content,"Require every member before Start",function()
+                        end,5,"Before automatic start, check Cloud status, Pause, and members who are loading or teleporting."))
+                        Y(uiKit.toggle(health.content,"Require every member before Start",function()
                             return config.opsStrictRoster==true
                         end,function(value)
                             config.opsStrictRoster=value==true; contextSaveConfig()
-                        end,3,"Strict mode: block Start even after Wait for Accounts expires. Off respects your configured wait timeout."))
-                        Y(uiKit.toggle(safe.content,"Discord Party alerts (Carry)",function()
+                        end,6,"Strict mode: block Start even after Wait for Accounts expires. Off respects your configured wait timeout."))
+                        Y(uiKit.toggle(health.content,"Discord Party alerts (Carry)",function()
                             return config.opsAlerts==true
                         end,function(value)
                             config.opsAlerts=value==true; contextSaveConfig()
-                        end,4,"Carry sends a rate-limited alert for a member who was online then lost heartbeat. Requires webhook URL."))
-                        local recover = uiKit.status(safe.content,"Recovery: waiting for sync",5)
-                        local alertView = uiKit.status(safe.content,"Alerts: off",6)
-                        local prog = uiKit.section(g,"Progress & Analytics",6,
-                            "Next level milestone and cross-PC session summaries via existing heartbeats.")
+                        end,7,"Carry sends a rate-limited alert for a member who was online then lost heartbeat. Requires webhook URL."))
+                        local recover = uiKit.status(health.content,"Recovery: waiting for sync",8)
+                        local alertView = uiKit.status(health.content,"Alerts: off",9)
+                        local prog = uiKit.section(dungeonSection.content,"Progress & Analytics",50,
+                            "Next map/level milestone and cross-PC Dungeon session analytics.")
                         local nextLevel=uiKit.status(prog.content,"Waiting for level data",1)
                         Y(uiKit.toggle(prog.content,"Track Party analytics",function()
                             return config.opsAnalytics~=false
@@ -93245,8 +93246,8 @@ local components = (function()
                             config.opsAnalytics=value==true; contextSaveConfig()
                         end,2,"Save local account run counts, wins, durations and level gains; Carry reads summaries from Firebase."))
                         local stats=uiKit.status(prog.content,"No reports received",3)
-                        local backup=uiKit.section(g,"Party Backup & Restore",7,
-                            "Carry-only configuration snapshots. Never saves Firebase tokens or Discord webhook URLs.")
+                        local backup=uiKit.section(contextRunsThisAccount.content,"Party Backup & Restore",51,
+                            "Carry-only Party configuration snapshots. Never saves Firebase tokens or Discord webhook URLs.")
                         local backupView=uiKit.status(backup.content,"No backup yet",1)
                         local backups=uiKit.buttonRow(backup.content,2)
                         backups.add("Backup now","plain",function()
@@ -93256,8 +93257,7 @@ local components = (function()
                             local ok,msg=ops.restore(); backupView.Text=tostring(msg)
                             if ok then contextRefreshAll() end
                         end,"Carry only: restore local Party with Run this party OFF for safety.")
-                        health.setOpen(true)
-                        safe.setOpen(false)
+                        health.setOpen(false)
                         prog.setOpen(false)
                         backup.setOpen(false)
                         task.spawn(function()
@@ -93684,7 +93684,7 @@ local components = (function()
                         uiKit.tip(t, "Take this account off the list.")
                     end
                 end
-                local z, s, T = uiKit.section(g, "Dungeon", 3, "Which dungeon the leader queues."), {}, {}
+                local z, s, T = dungeonSection, {}, {}
                 for index19, entry22 in ipairs(context.QUEUE_MAPS or {}) do
                     s[#s + 1] = {
                         value = entry22,
