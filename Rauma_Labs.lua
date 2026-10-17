@@ -1312,6 +1312,11 @@ local components = (function()
                 opsSafety = true,
                 opsStrictRoster = false,
                 opsAlerts = false,
+                -- Carry-only: pause the Party after the current run once ALL
+                -- enabled Leech levels have reached this threshold.
+                opsAutoStopEnabled = false,
+                opsAutoStopLevel = 200,
+                opsAutoStopFiredKey = "",
                 opsAnalytics = true,
                 opsStallSeconds = 55,
                 opsAlertSeconds = 90,
@@ -2027,6 +2032,9 @@ local components = (function()
                 "opsSafety",
                 "opsStrictRoster",
                 "opsAlerts",
+                "opsAutoStopEnabled",
+                "opsAutoStopLevel",
+                "opsAutoStopFiredKey",
                 "opsAnalytics",
                 "opsStallSeconds",
                 "opsAlertSeconds",
@@ -68050,6 +68058,9 @@ local components = (function()
                     return
                 end
                 lB.runOverAt = lB.runOverAt or j
+                if context.PartyOps and context.PartyOps.autoStopCheck then
+                    pcall(context.PartyOps.autoStopCheck)
+                end
                 -- One authoritative decision for Pause-after-run.  Checking
                 -- this here (not only inside contextReplayNow) is essential:
                 -- the game's native Auto Replay does not use our replay call.
@@ -70846,9 +70857,10 @@ local components = (function()
                 and fb.ownerUid ~= nil and fb.ownerUid == fb.uid
         end
         ops.paused = function()
-            -- Last confirmed Cloud pause remains binding through a transient
-            -- Firebase disconnect; never automatically resume on network loss.
-            return fb ~= nil and fb.controls ~= nil and fb.controls.paused == true
+            -- A pending automatic Pause already blocks local Replay before the
+            -- Firebase write finishes; all Leeches follow confirmed controls.
+            return ops.autoStopPending == true
+                or (fb ~= nil and fb.controls ~= nil and fb.controls.paused == true)
         end
         ops.replayDecision = function()
             if ops.paused() then return "paused: return to Lobby, no Replay" end
@@ -71067,6 +71079,110 @@ local components = (function()
             if success then ops.status=why end
             return success,why
         end
+        -- A one-shot threshold per Carry/roster/target. Resume remains usable:
+        -- after one automatic Pause, the same threshold will not re-pause
+        -- until the user disables/re-enables the toggle, changes the level,
+        -- or changes which Leeches are enabled in the Party.
+        ops.autoStopBusy = false
+        ops.autoStopPending = false
+        ops.autoStopRetryAt = 0
+        ops.autoStopNextCheckAt = 0
+        ops.autoStopStatus = "Off"
+        local function stopTarget()
+            return math.clamp(math.floor((tonumber(config.opsAutoStopLevel) or 200) + 0.5), 1, 200)
+        end
+        local function stopRosterKey(party, target)
+            local names = {}
+            for _, account in ipairs(party.accounts or {}) do
+                if account.enabled ~= false and account.role == "leech" then
+                    names[#names + 1] = tostring(account.name):lower()
+                end
+            end
+            table.sort(names)
+            return tostring(target) .. ":" .. tostring(localPlayer.UserId) .. ":" .. table.concat(names, ",")
+        end
+        ops.autoStopStatusText = function()
+            if config.opsAutoStopEnabled ~= true then return "Auto Stop: OFF" end
+            return "Auto Stop Lv " .. stopTarget() .. ": " .. tostring(ops.autoStopStatus)
+        end
+        ops.autoStopCheck = function()
+            if config.opsAutoStopEnabled ~= true then
+                ops.autoStopStatus = "Off"
+                return false
+            end
+            if not af or not af.minimumLeechLevel then
+                ops.autoStopStatus = "Waiting for Party level sync"
+                return false
+            end
+            -- Victory checks can run many times per second. Reading live
+            -- rosters and filesystem-backed levels once per second is enough.
+            local now = os.clock()
+            if now < ops.autoStopNextCheckAt then return ops.autoStopPending end
+            ops.autoStopNextCheckAt = now + 1
+            local party = myParty()
+            if not party or party.on ~= true then
+                ops.autoStopStatus = "Enable Run this party first"
+                return false
+            end
+            local lowest, unknown, count = af.minimumLeechLevel(party)
+            if count == 0 then
+                ops.autoStopStatus = "No enabled Leeches in Party"
+                return false
+            end
+            if type(unknown) == "table" and #unknown > 0 then
+                ops.autoStopStatus = "Waiting for level: " .. table.concat(unknown, ", ")
+                return false
+            end
+            if not lowest or lowest < 1 then
+                ops.autoStopStatus = "Waiting for Leech levels"
+                return false
+            end
+            local target = stopTarget()
+            if lowest < target then
+                ops.autoStopStatus = ("Lowest Leech Lv %d / %d"):format(lowest, target)
+                return false
+            end
+            local key = stopRosterKey(party, target)
+            if config.opsAutoStopFiredKey == key then
+                ops.autoStopStatus = ("Triggered at Lv %d; Resume will not re-trigger"):format(target)
+                return false
+            end
+            if not ops.isOwner() then
+                ops.autoStopStatus = ("Lv %d reached; waiting for Carry owner sync"):format(lowest)
+                return false
+            end
+            -- The existing Cloud pause is authoritative across PCs. Never
+            -- queue a second HTTP call if the cloud Party is already paused.
+            if fb and fb.controls and fb.controls.paused == true then
+                config.opsAutoStopFiredKey = key
+                if context.saveConfig then pcall(context.saveConfig) end
+                ops.autoStopStatus = "Target reached; Party was already paused"
+                return true
+            end
+            if ops.autoStopBusy or (os.clock() < ops.autoStopRetryAt) then
+                return ops.autoStopPending
+            end
+            ops.autoStopBusy = true
+            ops.autoStopPending = true
+            ops.autoStopStatus = ("Lowest Leech Lv %d reached Lv %d; pausing... "):format(lowest, target)
+            -- Do not block the gameplay event loop on Firebase HTTP. Pending
+            -- stops Carry replay locally until the Cloud write completes.
+            task.spawn(function()
+                local ok, sent, reason = pcall(ops.setPause, true)
+                ops.autoStopBusy = false
+                ops.autoStopPending = false
+                if ok and sent then
+                    config.opsAutoStopFiredKey = key
+                    if context.saveConfig then pcall(context.saveConfig) end
+                    ops.autoStopStatus = ("STOP activated: lowest Leech Lv %d >= %d"):format(lowest, target)
+                else
+                    ops.autoStopStatus = "Pause failed: " .. tostring(ok and reason or sent):sub(1, 130)
+                    -- Cloud may be briefly unavailable, but do not flood requests.
+                    ops.autoStopRetryAt = os.clock() + 15
+                end
+            end)
+            return true
+        end
         local function alert(kind, text)
             if config.opsAlerts~=true or not ops.isOwner() or not context.WH
                 or type(context.WH.post)~="function" then return end
@@ -71089,6 +71205,9 @@ local components = (function()
                 return
             end
             ops.lastCloudHealthy=os.clock()
+            -- Carry checks the synchronized minimum level every monitor tick.
+            -- Other PCs never issue Pause requests.
+            pcall(ops.autoStopCheck)
             if ops.paused() then ops.status="Party paused by Carry" else ops.status="Party active" end
             for _,member in ipairs(ops.members()) do
                 local key=member.name:lower()
@@ -93499,6 +93618,9 @@ local components = (function()
                                     nextLevel.Text=ops.nextLevelText()
                                     stats.Text=ops.analyticsText()
                                     backupView.Text=tostring(ops.backupStatus)
+                                    if context.autoStopStatusView and context.autoStopStatusView.Parent then
+                                        context.autoStopStatusView.Text=ops.autoStopStatusText()
+                                    end
                                 end)
                                 task.wait(2)
                             end
@@ -94192,6 +94314,60 @@ local components = (function()
                         10
                     )
                 )
+                Y(uiKit.toggle(
+                    LF.content,
+                    "Auto Stop Party at Leech level",
+                    function()
+                        return config.opsAutoStopEnabled == true
+                    end,
+                    function(value)
+                        local wanted = value == true
+                        if config.opsAutoStopEnabled ~= wanted then
+                            config.opsAutoStopEnabled = wanted
+                            -- Re-arm only when toggled by the user; Resume does
+                            -- NOT automatically arm the same level threshold again.
+                            config.opsAutoStopFiredKey = ""
+                            if context.PartyOps then
+                                context.PartyOps.autoStopStatus = wanted and "Armed; waiting for Leech levels" or "Off"
+                                context.PartyOps.autoStopNextCheckAt = 0
+                            end
+                            contextSaveConfig()
+                        end
+                    end,
+                    3,
+                    "Carry only. When every ENABLED Leech reaches the target level, automatically press the existing Pause after run cloud control. Finish the current Dungeon, then return to Lobby and wait."
+                ))
+                Y(uiKit.slider(
+                    LF.content,
+                    "Stop when lowest Leech reaches level",
+                    "Lv",
+                    1,
+                    200,
+                    false,
+                    function()
+                        return math.clamp(math.floor((tonumber(config.opsAutoStopLevel) or 200) + 0.5), 1, 200)
+                    end,
+                    function(value)
+                        local target = math.clamp(math.floor((tonumber(value) or 200) + 0.5), 1, 200)
+                        if config.opsAutoStopLevel ~= target then
+                            config.opsAutoStopLevel = target
+                            config.opsAutoStopFiredKey = ""
+                            if context.PartyOps then
+                                context.PartyOps.autoStopStatus = "Target changed; armed"
+                                context.PartyOps.autoStopNextCheckAt = 0
+                            end
+                            Z() -- Debounced write while dragging the slider
+                        end
+                    end,
+                    4,
+                    "Range 1-200, step 1. Based on the lowest known level of ALL enabled Leeches, including cached last-seen levels. Missing levels prevent stopping. The toggle above must be ON.",
+                    1
+                ))
+                local autoStopStatusView = uiKit.status(LF.content, "Auto Stop: OFF", 5)
+                context.autoStopStatusView = autoStopStatusView
+                if context.PartyOps and context.PartyOps.autoStopStatusText then
+                    autoStopStatusView.Text = context.PartyOps.autoStopStatusText()
+                end
                 Y(
                     uiKit.toggle(
                         LF.content,
