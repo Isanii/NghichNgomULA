@@ -67494,6 +67494,39 @@ local components = (function()
         end
         context.queueLog = contextQueueLog
         local function contextReplayNow()
+            -- Last-chance check: progress overrides Replay, including after a
+            -- cross-PC level update that arrived later than the win signal.
+            if context.AF and context.AF.progressReturnReason then
+                local dungeonValue = D("dungeonName")
+                local map = context.WH and context.WH.liveDungeon
+                    and context.WH.liveDungeon() or (dungeonValue and tostring(dungeonValue.Value)) or ""
+                local diff = context.WH and context.WH.liveDifficulty
+                    and context.WH.liveDifficulty() or nil
+                if not diff or diff == "" then
+                    pcall(function()
+                        local saved = game:GetService("HttpService"):JSONDecode(
+                            readfile(context.AF.partyFile("af_party")))
+                        if saved and tostring(saved.map):lower() == tostring(map):lower() then
+                            diff = saved.diff
+                        end
+                    end)
+                end
+                local ok, reason = pcall(context.AF.progressReturnReason, map, diff)
+                if ok and reason then
+                    lB.forceProgressReturn = lB.forceProgressReturn or reason
+                    lB.afMoveOn = lB.forceProgressReturn
+                    h("Progression: " .. tostring(reason) .. "; returning to Lobby")
+                    if context.MD and context.MD.goLobby then
+                        pcall(context.MD.goLobby)
+                    end
+                    return false
+                end
+                if lB.forceProgressReturn then
+                    h("Progression confirmed; returning to Lobby")
+                    if context.MD and context.MD.goLobby then pcall(context.MD.goLobby) end
+                    return false
+                end
+            end
             if context.PartyOps and context.PartyOps.paused() then
                 h("Party paused - replay held")
                 return false
@@ -67800,6 +67833,8 @@ local components = (function()
                 lB.replayFired = false
                 lB.finishedSeenAt = nil
                 lB.runOverAt = nil
+                lB.forceProgressReturn = nil
+                lB.ptLeaveSince = nil
                 lB.rodinPhase = false
                 lB.rodinSeenAt = nil
                 lB.rodinFinishedAt = nil
@@ -67934,38 +67969,36 @@ local components = (function()
                     end
                 else
                 end
-                lB.afMoveOn = nil
+                lB.afMoveOn = lB.forceProgressReturn
                 lB.afLevelWait = nil
-                if u ~= nil and context.AF and context.AF.plan then
-                    local success, nextMap, nextDiff, nextReq, minLevel = pcall(context.AF.plan)
+                if u ~= nil and context.AF and context.AF.progressReturnReason then
                     local dungeon = D("dungeonName")
-                    local currentMap = context.WH and context.WH.liveDungeon and context.WH.liveDungeon()
-                        or dungeon and tostring(dungeon.Value)
-                        or ""
-                    local isNormalDungeon = context.AF.LEVELS and context.AF.LEVELS[currentMap] ~= nil
-                    if context.AF.load().auto ~= false and isNormalDungeon and context.AF.planWaiting then
-                        lB.afLevelWait = context.AF.planWaiting
-                        _ = false
-                    elseif success and nextMap and currentMap ~= "" and (_ or isNormalDungeon) then
-                        local currentDiff = context.WH and context.WH.liveDifficulty
-                            and context.WH.liveDifficulty() or nil
-                        currentDiff = currentDiff and currentDiff:gsub(" %(Hardcore%)", "") or nil
-                        if not currentDiff or currentDiff == "" then
-                            pcall(function()
-                                local saved = game:GetService("HttpService"):JSONDecode(readfile(context.AF.partyFile("af_party")))
-                                if saved and saved.map == currentMap then currentDiff = saved.diff end
-                            end)
+                    local currentMap = context.WH and context.WH.liveDungeon
+                        and context.WH.liveDungeon() or (dungeon and tostring(dungeon.Value)) or ""
+                    local currentDiff = context.WH and context.WH.liveDifficulty
+                        and context.WH.liveDifficulty() or nil
+                    -- The Carry records the *actual lobby it created*, before its
+                    -- players teleport. This is important when aGame UI is absent.
+                    if not currentDiff or currentDiff == "" then
+                        pcall(function()
+                            local raw = readfile(context.AF.partyFile("af_party"))
+                            local saved = game:GetService("HttpService"):JSONDecode(raw)
+                            if saved and tostring(saved.map):lower() == tostring(currentMap):lower() then
+                                currentDiff = saved.diff
+                            end
+                        end)
+                    end
+                    local ok, reason = pcall(context.AF.progressReturnReason, currentMap, currentDiff)
+                    if ok and reason then
+                        if reason:find("waiting for Leech level:", 1, true) == 1 then
+                            lB.afLevelWait = reason:sub(#"waiting for Leech level: " + 1)
+                        else
+                            lB.forceProgressReturn = lB.forceProgressReturn or reason
+                            lB.afMoveOn = lB.forceProgressReturn
                         end
-                        local changedMap = string.lower(tostring(nextMap)) ~= string.lower(tostring(currentMap))
-                        local changedDiff = currentDiff and currentDiff ~= ""
-                            and string.lower(tostring(nextDiff)) ~= string.lower(tostring(currentDiff))
-                        if changedMap or changedDiff then
-                            lB.afMoveOn = ("%s %s%s"):format(
-                                tostring(nextMap), tostring(nextDiff),
-                                minLevel and (" (lowest Leech Lv %d)"):format(minLevel) or ""
-                            )
-                            _ = false
-                        end
+                        _ = false -- never replay while advancing or waiting for a missing level
+                    elseif lB.forceProgressReturn then
+                        _ = false -- lock in a confirmed advancement for this completed run
                     end
                 end
                 local U = false
@@ -68001,12 +68034,15 @@ local components = (function()
                                     and (config.afCarryLeaveAfter or 40) or 15) or 25)
                             if
                                 j - lB.ptLeaveSince >= w
-                                and j - (lB.ptLeaveAt or -math.huge) > 15
+                                and j - (lB.ptLeaveAt or -math.huge) > 6
                                 and context.MD
                                 and context.MD.goLobby
                             then
                                 lB.ptLeaveAt = j
-                                pcall(context.MD.goLobby)
+                                local ok, accepted, detail = pcall(context.MD.goLobby)
+                                if not ok or accepted == false then
+                                    h("Return to Lobby retry: " .. tostring(ok and detail or accepted))
+                                end
                             end
                             h(
                                 (
@@ -68494,6 +68530,26 @@ local components = (function()
                 return partyQueue.plan()
             end
             return E(p, true)
+        end
+        -- A single progression decision, shared by the victory loop and replay guard.
+        -- Never advance a dungeon in progress. Call only once it is completed.
+        partyQueue.progressReturnReason = function(currentMap, currentDiff)
+            local party = partyQueue.load()
+            if party.on ~= true or party.auto == false or partyQueue.role() == nil then return nil end
+            local map, difficulty, requirement, minLevel = partyQueue.plan()
+            if partyQueue.planWaiting then
+                return "waiting for Leech level: " .. tostring(partyQueue.planWaiting)
+            end
+            if not map or not difficulty or not currentMap or currentMap == "" then
+                return nil
+            end
+            local nameChanged = tostring(map):lower() ~= tostring(currentMap):lower()
+            local diffChanged = currentDiff ~= nil and tostring(currentDiff) ~= ""
+                and tostring(difficulty):lower() ~= tostring(currentDiff):gsub(" %(Hardcore%)", ""):lower()
+            if not nameChanged and not diffChanged then return nil end
+            local target = tostring(map) .. " " .. tostring(difficulty)
+            if minLevel then target ..= (" (lowest Leech Lv %d)"):format(minLevel) end
+            return "advance to " .. target
         end
         partyQueue.load = function(E)
             return partyQueue.loadReal(E)
@@ -94837,26 +94893,55 @@ local components = (function()
                 pcall(contextClearDrawing)
             end
             mD.goLobby = function()
-                if context.ActionGate and not context.ActionGate.claim("return", 18) then
-                    return
+                local now = os.clock()
+                if mD.returnJob ~= game.JobId then
+                    mD.returnJob, mD.returnFirstAt = game.JobId, nil
+                    mD.tries, mD.lastTry = 0, -math.huge
                 end
-                mD.tries, mD.lastTry = mD.tries + 1, os.clock()
+                if now - (mD.lastTry or -math.huge) < 5 then
+                    return false, "return cooldown"
+                end
+                -- Allow retries of our own return action, but never overlap
+                -- an unrelated Start/Replay/Join/Teleport action.
+                if context.ActionGate then
+                    local active = context.ActionGate.active()
+                    if active and active ~= "return" then
+                        return false, "waiting for " .. tostring(active)
+                    end
+                    if not active and not context.ActionGate.claim("return", 12) then
+                        return false, "another Party action"
+                    end
+                end
+                mD.lastTry, mD.tries = now, mD.tries + 1
+                mD.returnFirstAt = mD.returnFirstAt or now
                 local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("remotes")
-                local V = remotes and (remotes:FindFirstChild("ReturnToLobbyEvent"))
-                if V and mD.tries <= 2 then
-                    pcall(V.FireServer, V)
-                    context.log("ModDetect", "ReturnToLobbyEvent sent (try " .. mD.tries .. ")")
-                    return
+                local remote = remotes and remotes:FindFirstChild("ReturnToLobbyEvent")
+                if remote and mD.tries == 1 then
+                    local ok, err = pcall(remote.FireServer, remote)
+                    if ok then
+                        context.log("ModDetect", "ReturnToLobbyEvent requested; checking teleport")
+                        return true, "remote sent"
+                    end
+                    context.log("ModDetect", "ReturnToLobbyEvent failed: " .. tostring(err))
                 end
-                local q = 77649408247578
+                if remote and now - mD.returnFirstAt < 6 then
+                    return false, "waiting for return event"
+                end
+                local lobbyId = 77649408247578
                 pcall(function()
-                    local V = require(game:GetService("ReplicatedStorage").Utility.PlaceManager)
-                    q = V.GetLivePlaceIdByName("Lobby") or q
+                    local placeManager = require(game:GetService("ReplicatedStorage").Utility.PlaceManager)
+                    lobbyId = placeManager.GetLivePlaceIdByName("Lobby") or lobbyId
                 end)
-                pcall(function()
-                    game:GetService("TeleportService"):Teleport(q, localPlayer)
+                local ok, err = pcall(function()
+                    game:GetService("TeleportService"):Teleport(lobbyId, localPlayer)
                 end)
-                context.log("ModDetect", "teleport to the lobby place sent (try " .. mD.tries .. ")")
+                if not ok then
+                    context.log("ModDetect", "Lobby teleport failed: " .. tostring(err))
+                    if context.ActionGate then context.ActionGate.cancel("return") end
+                    return false, "teleport failed: " .. tostring(err)
+                end
+                context.log("ModDetect", "Lobby teleport requested (try " .. mD.tries .. ")")
+                return true, "teleport requested"
             end
             mD.noteKick = function(q)
                 if not mD.canFiles then
