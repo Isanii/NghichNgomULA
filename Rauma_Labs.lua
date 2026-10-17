@@ -66171,7 +66171,7 @@ local components = (function()
         end
         task.spawn(function()
             while not state.destroyed do
-                task.wait(2)
+                task.wait(1)
                 if not state.destroyed then
                     pcall(syncFromDisk)
                 end
@@ -66192,6 +66192,20 @@ local components = (function()
             pairingProblem = nil, ownerMismatch = nil,
         }
         context.FirebaseSync = firebase
+        -- Faster foreground synchronization for a small Party. A single 1.25s interval
+        -- cannot promise 1-2s end-to-end on slow networks or during Firebase throttling.
+        -- Keep analytics, owner refresh, uploads and other non-urgent work at slower intervals.
+        local FAST = {
+            approvals = 1.25,    -- Leech notices an approval
+            requests = 1.25,     -- Carry notices a Leech pairing request
+            party = 1.25,        -- Leech notices Party edits
+            heartbeat = 1.5,    -- Script online/lobby/dungeon state
+            presence = 1.5,     -- Carry/Leech status display
+            controls = 1.5,     -- Party Pause/Resume
+            idle = 0.5,         -- Loop frequency, not an HTTP request frequency
+        }
+        firebase.syncSpeed = FAST
+        firebase.lastCycleMs = 0
         -- One action owner across Party Queue, Cloud follow and Return-to-Lobby flows.
         -- Reservations expire automatically if Roblox teleports before cleanup executes.
         local gate = {kind = nil, untilAt = 0, blocked = 0, accepted = 0, last = "Idle"}
@@ -66361,7 +66375,7 @@ local components = (function()
             if not firebase.db or not credential or not credential.token or not firebase.cloudReady then
                 return nil, "Firebase not synchronized"
             end
-            if not force and firebase.controlsAt and os.clock() - firebase.controlsAt < 6 then
+            if not force and firebase.controlsAt and os.clock() - firebase.controlsAt < FAST.controls then
                 return firebase.controls
             end
             local result, err = request("GET", url(firebase.db, "controls"))
@@ -66553,6 +66567,9 @@ local components = (function()
         firebase.checkNow = function()
             firebase.wakeSequence = (firebase.wakeSequence or 0) + 1
             firebase.nextAt = 0
+            -- A manual refresh or Party edit should not wait for cached polling windows.
+            -- The sync remains serialized by firebase.busy to avoid overlapping writes.
+            firebase.fastRefresh = true
         end
         firebase.refreshRequests = function()
             firebase.pendingClock = nil
@@ -66781,9 +66798,13 @@ local components = (function()
         end
         local function guestParty(db, party, owner)
             if guestRaw and party.cloudDoc and firebase.guestReadAt
-                and os.clock() - firebase.guestReadAt < 5 then return true end
+                and os.clock() - firebase.guestReadAt < FAST.party then return true end
             local approval = firebase.approval
-            if not firebase.approvalCheckedAt or os.clock() - firebase.approvalCheckedAt >= 10 then
+            -- Pending approvals need fast polling; once approved, 5s is enough
+            -- for rechecking authorization while Party updates remain fast.
+            local approvalInterval = type(firebase.approval) == "table"
+                and firebase.approval.name == player.Name and 5 or FAST.approvals
+            if not firebase.approvalCheckedAt or os.clock() - firebase.approvalCheckedAt >= approvalInterval then
                 local err
                 approval, err = request("GET", url(db, "approved/" .. credential.uid))
                 if err then
@@ -66793,7 +66814,8 @@ local components = (function()
                 firebase.approval, firebase.approvalCheckedAt = approval, os.clock()
             end
             if type(approval) ~= "table" or approval.name ~= player.Name then
-                firebase.approvalCheckedAt = nil
+                -- Do NOT reset approvalCheckedAt here. In the old script that forced
+                -- an extra GET on every loop and could trigger Firebase throttling.
                 if os.clock() - (firebase.requestAt or -math.huge) >= 15 then
                     local _, requestErr = request("PUT", url(db, "requests/" .. credential.uid), httpService:JSONEncode({
                         uid = credential.uid, name = player.Name, at = {[".sv"] = "timestamp"},
@@ -67153,7 +67175,7 @@ local components = (function()
             local guest = firebase.isGuest()
             -- Pairing inbox is independent of Party publish. Never hide new requests
             -- just because the local Party file is missing or still being edited.
-            if not guest and (not firebase.pendingClock or os.clock() - firebase.pendingClock >= 7) then
+            if not guest and (not firebase.pendingClock or os.clock() - firebase.pendingClock >= FAST.requests) then
                 party.loadReal(true)
                 local inboxOK, inboxErr = pendingRequests(db, party)
                 if not inboxOK then return nil, inboxErr end
@@ -67163,12 +67185,12 @@ local components = (function()
             if guest then ready, partyErr = guestParty(db, party, owner)
             else ready, partyErr = publishParty(db, party) end
             if not ready then return nil, partyErr end
-            if not firebase.heartbeatClock or os.clock() - firebase.heartbeatClock >= 3 then
+            if not firebase.heartbeatClock or os.clock() - firebase.heartbeatClock >= FAST.heartbeat then
                 local heartOK, heartErr = ownHeartbeat(db)
                 if not heartOK then return nil, heartErr end
                 firebase.heartbeatClock = os.clock()
             end
-            if not firebase.readHealthy or not firebase.presenceClock or os.clock() - firebase.presenceClock >= 6 then
+            if not firebase.readHealthy or not firebase.presenceClock or os.clock() - firebase.presenceClock >= FAST.presence then
                 local presOK, presErr = allPresence(db, party)
                 if not presOK then return nil, presErr end
                 firebase.presenceClock = os.clock()
@@ -67177,7 +67199,7 @@ local components = (function()
                 if firebase.backupOwner() then firebase.backupRefresh = credential.refresh end
             end
             firebase.cloudReady = true
-            if not firebase.controlsAt or os.clock() - firebase.controlsAt >= 6 then
+            if not firebase.controlsAt or os.clock() - firebase.controlsAt >= FAST.controls then
                 -- Control reads are independent of heartbeats: guests should still report online
                 -- if the separate control node is not yet deployed in Firebase rules.
                 pcall(firebase.readControls, true)
@@ -67215,8 +67237,17 @@ local components = (function()
                     firebase.busy = true
                     local startedAt, wakeSequence = os.clock(), firebase.wakeSequence or 0
                     local generation = firebase.generation or 0
+                    if firebase.fastRefresh then
+                        firebase.fastRefresh = false
+                        firebase.pendingClock = nil
+                        firebase.approvalCheckedAt = nil
+                        firebase.guestReadAt = nil
+                        firebase.presenceClock = nil
+                        firebase.controlsAt = nil
+                    end
                     firebase.cycleGeneration = generation
                     local ok, result, err = pcall(cycle)
+                    firebase.lastCycleMs = math.floor((os.clock() - startedAt) * 1000 + 0.5)
                     if generation ~= (firebase.generation or 0) then
                         invalidate("Settings changed - reconnecting")
                         if context.AF and context.AF.clearCloudDocument then context.AF.clearCloudDocument() end
@@ -67225,15 +67256,28 @@ local components = (function()
                         if not ok or not result then invalidate(tostring(ok and err or result):sub(1, 160)) end
                         if not ok or not result then
                             local message = tostring(ok and err or result)
-                            if message:find("Waiting", 1, true) or message:find("Carry:", 1, true) then
-                                firebase.nextAt = os.clock() + 1
+                            local lower = message:lower()
+                            -- Waiting for an approval or first Carry Party is normal, not a
+                            -- network/auth error. Never apply the 2/4/8/15s backoff to it.
+                            local expectedWait = not (lower:find("http ", 1, true)
+                                or lower:find("denied", 1, true) or lower:find("failed", 1, true)
+                                or lower:find("mismatch", 1, true) or lower:find("invalid", 1, true))
+                                and (lower:find("waiting", 1, true)
+                                    or lower:find("approve", 1, true)
+                                    or lower:find("carry:", 1, true)
+                                    or lower:find("pairing retry queued", 1, true))
+                            if expectedWait then
+                                firebase.failures = 0
+                                firebase.nextAt = os.clock() + FAST.idle
                             else
+                                -- Real HTTP/Rules errors retain bounded exponential backoff.
                                 firebase.failures = math.min((firebase.failures or 0) + 1, 5)
                                 firebase.nextAt = os.clock() + math.min(15, 2 ^ firebase.failures)
                             end
                         else
                             firebase.failures = 0
-                            firebase.nextAt = (firebase.wakeSequence or 0) ~= wakeSequence and 0 or math.max(os.clock() + 0.1, startedAt + 1)
+                            firebase.nextAt = (firebase.wakeSequence or 0) ~= wakeSequence
+                                and 0 or math.max(os.clock() + 0.1, startedAt + FAST.idle)
                         end
                     end
                     firebase.cycleGeneration = nil
@@ -92930,6 +92974,8 @@ local components = (function()
                     "This account only. Off still syncs Party and account status. On follows the Party leader to its lobby; it does not interrupt your current run or bypass private-server restrictions."))
                     local joinStatus = uiKit.status(diagnosticsSection.content, "Join: off", 4)
                     local perfStatus = uiKit.status(diagnosticsSection.content, "Actions: idle | Firebase requests: 0", 15)
+                    local syncSpeedStatus = uiKit.status(diagnosticsSection.content,
+                        "Fast Sync: active | pairing / Party / presence ~1.25-1.5s polling", 18)
                     uiKit.button(diagnosticsSection.content, "Refresh Party and status", "plain", function()
                         fb.checkNow()
                     end, 5, "Request the next Firebase refresh now.")
@@ -93000,6 +93046,8 @@ local components = (function()
                                 tostring(gate and (gate.active() or "idle") or "idle"),
                                 gate and gate.blocked or 0, counters.total or 0,
                                 counters.failed or 0, counters.lastMs or 0)
+                            syncSpeedStatus.Text = ("Fast Sync ON | request/pairing: 1.25s | presence: 1.5s | cycle: %dms")
+                                :format(tonumber(fb.lastCycleMs) or 0)
                             fbStatus.Text = "Firebase: " .. tostring(fb.status)
                             fbUid.Text = "Firebase identity: " .. tostring(fb.uid or "not connected"):sub(1, 12)
                             fbCloud.Text = "Cloud Party: " .. (fb.cloudReady and "synced" or "waiting / disconnected")
@@ -93024,7 +93072,7 @@ local components = (function()
                                     tostring(fb.ownerUid or "-"):sub(1, 8),
                                     tostring(fb.uid or "-"):sub(1, 8),
                                     fb.ownerUid == fb.uid and counts or tostring(fb.pairingStatus or "waiting"))
-                            task.wait(1)
+                            task.wait(0.4)
                         end
                     end)
                 end
