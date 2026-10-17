@@ -66188,6 +66188,8 @@ local components = (function()
             status = "waiting for Firebase URL and Web API Key", uid = nil,
             ownerUid = nil, cloudReady = false, cloudPresence = {},
             pending = {}, remote = nil, nextAt = 0, busy = false,
+            pairingStatus = "Not checked", pairingDiagnostics = nil,
+            pairingProblem = nil, ownerMismatch = nil,
         }
         context.FirebaseSync = firebase
         -- One action owner across Party Queue, Cloud follow and Return-to-Lobby flows.
@@ -66528,6 +66530,8 @@ local components = (function()
             firebase.nextAt = 0
             firebase.cloudPresence, firebase.pending = {}, {}
             firebase.ownerUid, firebase.ownerName = nil, nil
+            firebase.ownerMismatch, firebase.pairingProblem = nil, nil
+            firebase.pairingStatus, firebase.pairingDiagnostics = "Reconnecting", nil
             firebase.serverAt, firebase.lastReadClock = nil, nil
             lastPublished, lastPublishedAt, guestRaw = nil, nil, nil
             firebase.guestReadAt = nil
@@ -66549,6 +66553,22 @@ local components = (function()
         firebase.checkNow = function()
             firebase.wakeSequence = (firebase.wakeSequence or 0) + 1
             firebase.nextAt = 0
+        end
+        firebase.refreshRequests = function()
+            firebase.pendingClock = nil
+            firebase.pairingStatus = "Refreshing pairing requests..."
+            firebase.checkNow()
+            return true, "Checking requests against enabled Party accounts"
+        end
+        firebase.retryPairing = function()
+            if config.firebaseRole == "carry" then
+                return false, "This account is set as Firebase Carry. Use Recover Carry owner if UID has changed."
+            end
+            firebase.requestAt = nil
+            firebase.approvalCheckedAt = nil
+            firebase.pairingStatus = "Pairing retry queued..."
+            firebase.checkNow()
+            return true, "Pairing request retry queued; check the pairing status"
         end
         firebase.recoveryFile = (context.PATH and context.PATH.data or "RaumaLabs/data")
             .. "/owner_recovery_" .. tostring(player.UserId) .. ".json"
@@ -66659,20 +66679,49 @@ local components = (function()
         end
         local function pendingRequests(db, party)
             local records, err = request("GET", url(db, "requests"))
-            if err then return nil, "Pairing requests: " .. err end
+            if err then
+                firebase.pairingStatus = "Carry cannot read requests: " .. tostring(err)
+                return nil, "Pairing requests: " .. err
+            end
             local approved, approvalErr = request("GET", url(db, "approved"))
-            if approvalErr then return nil, "Pairing approvals: " .. approvalErr end
+            if approvalErr then
+                firebase.pairingStatus = "Carry cannot read approvals: " .. tostring(approvalErr)
+                return nil, "Pairing approvals: " .. approvalErr
+            end
             local pending = {}
+            local details = {received = 0, eligible = 0, notListed = 0, stale = 0, approved = 0, invalid = 0}
+            local firstUnlisted
             for uid, item in pairs(type(records) == "table" and records or {}) do
-                local age = type(item) == "table" and serverNow() - (tonumber(item.at) or 0) / 1000 or math.huge
-                if type(item) == "table" and item.uid == uid and type(item.name) == "string"
-                    and enabledMember(party.doc, item.name) and age >= -60 and age <= 120
-                    and not (type(approved) == "table" and approved[uid]) then
+                details.received += 1
+                local valid = type(item) == "table" and item.uid == uid and type(item.name) == "string"
+                local age = valid and serverNow() - (tonumber(item.at) or 0) / 1000 or math.huge
+                if not valid then
+                    details.invalid += 1
+                elseif type(approved) == "table" and approved[uid] then
+                    details.approved += 1
+                elseif age < -60 or age > 120 then
+                    details.stale += 1
+                elseif not enabledMember(party.doc, item.name) then
+                    details.notListed += 1
+                    firstUnlisted = firstUnlisted or tostring(item.name)
+                else
+                    details.eligible += 1
                     pending[#pending + 1] = {uid = uid, name = item.name, at = item.at}
                 end
             end
             table.sort(pending, function(a, b) return a.name < b.name end)
-            firebase.pending = pending
+            firebase.pending, firebase.pairingDiagnostics = pending, details
+            if details.notListed > 0 then
+                firebase.pairingStatus = ("%d request(s) hidden: %s is not enabled in Carry's Party")
+                    :format(details.notListed, firstUnlisted or "a username")
+            elseif details.eligible > 0 then
+                firebase.pairingStatus = ("%d Leech request(s) ready to Approve"):format(details.eligible)
+            elseif details.received > 0 then
+                firebase.pairingStatus = ("No eligible request: %d approved, %d stale, %d invalid")
+                    :format(details.approved, details.stale, details.invalid)
+            else
+                firebase.pairingStatus = "No pairing requests received from other devices"
+            end
             return true
         end
         firebase.approve = function(uid)
@@ -66707,20 +66756,35 @@ local components = (function()
             if not firebase.approvalCheckedAt or os.clock() - firebase.approvalCheckedAt >= 10 then
                 local err
                 approval, err = request("GET", url(db, "approved/" .. credential.uid))
-                if err then return nil, "Approval lookup: " .. err end
+                if err then
+                    firebase.pairingStatus = "Cannot check Approval: " .. tostring(err)
+                    return nil, "Approval lookup: " .. err
+                end
                 firebase.approval, firebase.approvalCheckedAt = approval, os.clock()
             end
             if type(approval) ~= "table" or approval.name ~= player.Name then
                 firebase.approvalCheckedAt = nil
-                if os.clock() - (firebase.requestAt or -math.huge) >= 5 then
+                if os.clock() - (firebase.requestAt or -math.huge) >= 15 then
                     local _, requestErr = request("PUT", url(db, "requests/" .. credential.uid), httpService:JSONEncode({
                         uid = credential.uid, name = player.Name, at = {[".sv"] = "timestamp"},
                     }))
-                    if requestErr then return nil, "Pairing request: " .. requestErr end
+                    if requestErr then
+                        firebase.pairingStatus = "Request upload failed: " .. tostring(requestErr)
+                        return nil, "Pairing request: " .. requestErr
+                    end
+                    -- Confirm that the guest can read back its own request through the deployed Rules.
+                    local confirmation, verifyErr = request("GET", url(db, "requests/" .. credential.uid))
+                    if verifyErr or type(confirmation) ~= "table"
+                        or confirmation.uid ~= credential.uid or confirmation.name ~= player.Name then
+                        firebase.pairingStatus = "Request sent, but confirmation failed: " .. tostring(verifyErr or "record mismatch")
+                        return nil, firebase.pairingStatus
+                    end
                     firebase.requestAt = os.clock()
+                    firebase.pairingStatus = "Request uploaded and verified; waiting for " .. owner.name .. " to Approve"
                 end
-                return nil, "Waiting for Carry to approve " .. player.Name
+                return nil, "Pairing request sent - waiting for Carry to approve " .. player.Name
             end
+            firebase.pairingStatus = "Approved by Carry; synchronizing Party"
             local payload, readErr = request("GET", url(db, "party"))
             if readErr then return nil, "Party download: " .. readErr end
             if type(payload) ~= "table" or payload.ownerUid ~= owner.uid or payload.ownerName ~= owner.name then
@@ -67040,6 +67104,22 @@ local components = (function()
             if not party then return nil, "Waiting for Party module" end
             local owner, ownerErr = inspectOwner(db, party)
             if not owner then return nil, ownerErr end
+            -- A Firebase project already has a single owner UID. Selecting Carry locally
+            -- never transfers that identity or authorizes a second owner.
+            firebase.ownerMismatch = nil
+            if credential.uid ~= owner.uid and (config.firebaseRole == "carry"
+                or tostring(owner.name):lower() == player.Name:lower()) then
+                local explanation
+                if tostring(owner.name):lower() == player.Name:lower() then
+                    explanation = "Carry owner UID changed. Use Recover Carry owner with the original backup; do NOT approve your own Carry."
+                else
+                    explanation = "Firebase belongs to Carry " .. tostring(owner.name)
+                        .. ". Use that Carry account or a different Firebase project."
+                end
+                firebase.ownerMismatch = explanation
+                firebase.pairingStatus = explanation
+                return nil, explanation
+            end
             local guest = firebase.isGuest()
             local ready, partyErr
             if guest then ready, partyErr = guestParty(db, party, owner)
@@ -67076,6 +67156,7 @@ local components = (function()
                 pcall(runState, db, party, guest)
                 firebase.runClock = os.clock()
             end
+            if guest then firebase.pairingStatus = "Approved - Party synced" end
             status(guest and "Party synced - account status live"
                 or ("Carry online | " .. #firebase.pending .. " pending approvals"))
             return true
@@ -92700,7 +92781,7 @@ local components = (function()
                         config.firebaseRole = value
                         contextSaveConfig()
                         fb.reconnect()
-                    end, 0, "First setup: select Carry only on the account that owns the project. Other accounts use Leech / member. An existing owner remains the owner."))
+                    end, 0, "Carry role must match the saved Firebase owner UID; switching the dropdown does not transfer ownership. A Carry owner mismatch needs a recovery credential backup. Other accounts use Leech / member."))
                     local sharedSettings = context.FirebaseShared
                     local sharedUrlInput = uiKit.textInput(section.content, "Realtime Database URL", function()
                         return config.firebaseDatabaseUrl or ""
@@ -92767,6 +92848,17 @@ local components = (function()
                     local fbCloud = uiKit.caption(section.content, "Cloud Party: off", 9)
                     local fbShared = uiKit.caption(section.content, "Local Firebase settings: checking", 10)
                     local pairing = uiKit.caption(section.content, "Pairing: waiting for Carry", 11)
+                    local pairingDetails = uiKit.caption(section.content, "Pairing diagnostics: checking", 16)
+                    local pairingActions = uiKit.buttonRow(section.content, 17)
+                    pairingActions.add("Retry Leech request", "plain", function()
+                        local ok, message = fb.retryPairing()
+                        pairingDetails.Text = tostring(message)
+                        if not ok and context.notify then context.notify("warning", "Firebase Pairing", tostring(message)) end
+                    end, "Leech only: resend your pairing request and show Firebase permissions errors.")
+                    pairingActions.add("Refresh Carry requests", "plain", function()
+                        local ok, message = fb.refreshRequests()
+                        pairingDetails.Text = tostring(message)
+                    end, "Carry: re-read requests now, including the count rejected by roster filters.")
                     local actionRow = uiKit.buttonRow(section.content, 12)
                     actionRow.add("Approve next Leech", "accent", function()
                         local nextRequest = fb.pending and fb.pending[1]
@@ -92797,13 +92889,25 @@ local components = (function()
                             fbCloud.Text = "Cloud Party: " .. (fb.cloudReady and "synced" or "waiting / disconnected")
                             fbShared.Text = "Local Firebase settings: " .. tostring(sharedSettings and sharedSettings.status or "unavailable")
                             local nextRequest = fb.pending and fb.pending[1]
-                            if fb.ownerUid and fb.uid == fb.ownerUid then
+                            if fb.ownerMismatch then
+                                pairing.Text = "Owner mismatch: " .. tostring(fb.ownerMismatch)
+                            elseif fb.ownerUid and fb.uid == fb.ownerUid then
                                 pairing.Text = nextRequest and ("Approve " .. nextRequest.name .. " | UID "
                                     .. nextRequest.uid:sub(1, 7) .. "... (" .. #fb.pending .. " waiting)")
-                                    or "Pairing: no pending Leeches"
+                                    or "Pairing: no eligible Leech requests"
                             else
-                                pairing.Text = "Pairing: Carry approves this Leech once; then fully automatic"
+                                pairing.Text = "Leech pairing: " .. tostring(fb.pairingStatus or "connecting")
                             end
+                            local d = fb.pairingDiagnostics
+                            local counts = d and ("Requests: %d received | %d eligible | %d unlisted | %d stale")
+                                :format(d.received or 0, d.eligible or 0, d.notListed or 0, d.stale or 0)
+                                or "Requests: not read yet"
+                            pairingDetails.Text = ("Selected role: %s | Owner: %s (%s) | Local UID: %s | %s")
+                                :format(tostring(config.firebaseRole or "leech"),
+                                    tostring(fb.ownerName or "unknown"),
+                                    tostring(fb.ownerUid or "-"):sub(1, 8),
+                                    tostring(fb.uid or "-"):sub(1, 8),
+                                    fb.ownerUid == fb.uid and counts or tostring(fb.pairingStatus or "waiting"))
                             task.wait(1)
                         end
                     end)
