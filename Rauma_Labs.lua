@@ -67779,29 +67779,14 @@ local components = (function()
                 end
             end
             u = context.AF and context.AF.role() or nil
-            if lB.place == "Lobby" and u and j - (lB.playPressAt or -math.huge) > 3 then
-                local _ = localPlayer:FindFirstChild("PlayerGui")
-                local J, w = _ and (_:FindFirstChild("introGui"))
-                if J and J.Enabled ~= false then
-                    _ = J:FindFirstChild("title")
-                    local J = _ and (_:FindFirstChild("Frame"))
-                    w = J and (J:FindFirstChildWhichIsA("TextButton"))
-                else
-                end
-                if w and w.Visible and w.AbsoluteSize.X > 1 then
+            -- The title Play button is not a Party action: press it on first setup too.
+            if (lB.place == "Lobby" or lB.place == "?")
+                and j - (lB.playPressAt or -math.huge) > 1.5
+                and context.TitlePlay
+                and context.TitlePlay.press
+            then
+                if context.TitlePlay.press() then
                     lB.playPressAt = j
-                    pcall(function()
-                        if getconnections then
-                            local _ = { "MouseButton1Click", "Activated", "MouseButton1Down" }
-                            for index, entry in ipairs(_) do
-                                for index2, entry2 in ipairs(getconnections(w[entry])) do
-                                    entry2:Fire()
-                                end
-                            end
-                        elseif firesignal then
-                            firesignal(w.MouseButton1Click)
-                        end
-                    end)
                     h("title screen: pressing Play")
                     return
                 end
@@ -89227,6 +89212,27 @@ local components = (function()
                 "RaumaLabsUI", false, true, 100, Enum.ZIndexBehavior.Sibling
             dungeonAutofarmUi.Parent = parent
             runtimeState.scriptGui = dungeonAutofarmUi
+            -- Reveal the hub only after the title screen is dismissed.
+            -- Do not hide forever if the game changes its intro GUI.
+            local introStart = context.TitlePlay
+            if introStart and introStart.isTitleVisible and introStart.isTitleVisible() then
+                dungeonAutofarmUi.Enabled = false
+                task.spawn(function()
+                    local began = os.clock()
+                    while dungeonAutofarmUi.Parent and not runtimeState.destroyed do
+                        if not introStart.isTitleVisible() then break end
+                        if os.clock() - began > 45 then
+                            warn("[Rauma Labs] Title screen still visible: exposing hub for diagnostics.")
+                            break
+                        end
+                        introStart.press()
+                        task.wait(0.3)
+                    end
+                    if dungeonAutofarmUi.Parent and not runtimeState.destroyed then
+                        dungeonAutofarmUi.Enabled = true
+                    end
+                end)
+            end
             uiKit.ensureTip(dungeonAutofarmUi)
             local shell = context.buildShell(dungeonAutofarmUi)
             context.Shell = shell
@@ -104159,12 +104165,146 @@ local components = (function()
         end)
     end
 
+    -- Title-screen bootstrap: auto-enter the game lobby before Rauma Labs UI is built.
+    -- This is independent of Party membership. A first-run Carry/Leech has no AF.role() yet.
+    components.titleScreenBootstrap = function(context)
+        local player = context.LocalPlayer
+        local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+        if not playerGui and player then
+            playerGui = player:WaitForChild("PlayerGui", 10)
+        end
+        local state = {
+            lastPress = -math.huge,
+            attempts = 0,
+            sawTitle = false,
+            lastMethod = "none",
+        }
+        context.TitlePlay = state
+        if not playerGui then return end
+
+        local function visibleThrough(object, root)
+            while object and object ~= root do
+                if object:IsA("GuiObject") and not object.Visible then return false end
+                object = object.Parent
+            end
+            return true
+        end
+        local function introGui()
+            local intro = playerGui:FindFirstChild("introGui")
+            if not intro then
+                intro = playerGui:FindFirstChild("introGui", true)
+            end
+            if intro and intro:IsA("ScreenGui") and intro.Enabled then
+                return intro
+            end
+            return nil
+        end
+        local function titleButton()
+            local intro = introGui()
+            if not intro then return nil end
+            local title = intro:FindFirstChild("title", true)
+            local content = title or intro
+            local fallback
+            for _, candidate in ipairs(content:GetDescendants()) do
+                if (candidate:IsA("TextButton") or candidate:IsA("ImageButton"))
+                    and candidate.Visible
+                    and candidate.AbsoluteSize.X > 1
+                    and candidate.AbsoluteSize.Y > 1
+                    and visibleThrough(candidate, intro)
+                then
+                    local caption = candidate:IsA("TextButton") and candidate.Text or ""
+                    local hint = (candidate.Name .. " " .. caption):lower()
+                    if hint:find("play", 1, true) or hint:find("start", 1, true) then
+                        return candidate
+                    end
+                    fallback = fallback or candidate
+                end
+            end
+            -- Original Dungeon Quest UI has title.Frame.TextButton without a Play name.
+            return fallback
+        end
+        state.titleButton = titleButton
+        state.isTitleVisible = function()
+            return titleButton() ~= nil
+        end
+        state.press = function()
+            local button = titleButton()
+            if not button then return false end
+            state.sawTitle = true
+            local now = os.clock()
+            if now - state.lastPress < 1.6 or state.attempts >= 8 then return false end
+            state.lastPress, state.attempts = now, state.attempts + 1
+            local pressed = false
+            -- Prefer the existing signal method from the original script if Real supports it.
+            if type(getconnections) == "function" then
+                for _, eventName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down"}) do
+                    local ok, connections = pcall(function()
+                        return getconnections(button[eventName])
+                    end)
+                    if ok and type(connections) == "table" then
+                        for _, connection in ipairs(connections) do
+                            local fired = pcall(function() connection:Fire() end)
+                            if fired then pressed = true end
+                        end
+                    end
+                end
+                if pressed then state.lastMethod = "getconnections" end
+            end
+            if not pressed and type(firesignal) == "function" then
+                pressed = pcall(function() firesignal(button.Activated) end)
+                if not pressed then
+                    pressed = pcall(function() firesignal(button.MouseButton1Click) end)
+                end
+                if pressed then state.lastMethod = "firesignal" end
+            end
+            if not pressed then
+                local vim = context.VirtualInputManager
+                if vim then
+                    pressed = pcall(function()
+                        local point = button.AbsolutePosition + button.AbsoluteSize / 2
+                        vim:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+                        task.wait(0.05)
+                        vim:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+                    end)
+                    if pressed then state.lastMethod = "VirtualInputManager" end
+                end
+            end
+            if pressed and context.log then
+                pcall(context.log, "Startup", "Title screen: Play (" .. state.lastMethod .. ")")
+            end
+            return pressed
+        end
+
+        -- Start the game first, then create the Rauma Labs ScreenGui.
+        -- Keep a finite deadline so a changed title-screen UI cannot freeze startup.
+        local started = os.clock()
+        while not (context.RT and context.RT.destroyed) do
+            local onTitle = state.isTitleVisible()
+            if onTitle then
+                state.sawTitle = true
+                state.press()
+            elseif state.sawTitle then
+                break -- Play completed: the title button has disappeared.
+            elseif os.clock() - started >= 3.5 then
+                break -- Already in the lobby/dungeon, or the title menu is absent.
+            end
+            if os.clock() - started >= 16 then
+                if onTitle then
+                    warn("[Rauma Labs] Play screen did not close. Please click Play manually; UI will still load.")
+                end
+                break
+            end
+            task.wait(0.15)
+        end
+    end
+
     return components
 end)()
 
 local context = {}
 components.coreSettings(context)
 context.loadConfig()
+components.titleScreenBootstrap(context)
 context.CFG.statsEnabled = false
 context.CFG.statsKey = nil
 context.CFG.statsUrl = nil
