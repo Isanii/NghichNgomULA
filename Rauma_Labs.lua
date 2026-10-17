@@ -66369,44 +66369,128 @@ local components = (function()
         local function url(db, resource)
             return db .. "/raumaLabs/" .. resource .. ".json?auth=" .. httpService:UrlEncode(credential.token)
         end
+        -- Cloud controls are optional for the rest of Party sync, but the buttons must
+        -- never claim success until Firebase confirms a write. A missing /controls Rule
+        -- is a common cause of RTDB HTTP 401 (Permission denied).
         firebase.controls = {paused = false}
         firebase.controlsStatus = "Waiting for Cloud controls"
+        firebase.controlsBusy = false
+        firebase.controlsEpoch = 0
+        firebase.controlsNextReadAt = 0
+        local function controlsError(raw)
+            local msg = tostring(raw or "Unknown Firebase error")
+            if msg:find("HTTP 401", 1, true) or msg:find("HTTP 403", 1, true) then
+                return "HTTP 401/403 on raumaLabs/controls: check Firebase RTDB Rules "
+                    .. "(.read for owner + approved members, .write for owner). "
+                    .. msg:sub(1, 110)
+            end
+            return msg
+        end
+        local function controlsRequest(method, payload)
+            local result, err = request(method, url(firebase.db, "controls"), payload)
+            if not err then return result end
+            local denied = err:find("HTTP 401", 1, true) or err:find("HTTP 403", 1, true)
+            local lowered = err:lower()
+            local tokenProblem = lowered:find("token", 1, true)
+                or lowered:find("credential", 1, true)
+                or lowered:find("expired", 1, true)
+            -- For interactive actions retry once after refreshing the ID token. For
+            -- recurring GETs, refresh only for explicit token errors, never each time
+            -- a missing Firebase Rule produces a 401.
+            if denied and (method == "PUT" or tokenProblem)
+                and os.clock() - (firebase.controlsAuthRetryAt or -math.huge) >= 30 then
+                firebase.controlsAuthRetryAt = os.clock()
+                local previousUid = credential and credential.uid
+                if credential then credential.untilAt = 0 end
+                local db, key, endpointErr = endpoint()
+                if not db then return nil, endpointErr end
+                local authed, authErr = auth(db, key)
+                if not authed then
+                    return nil, "Firebase token refresh failed: " .. tostring(authErr)
+                end
+                if not credential or credential.uid ~= previousUid
+                    or (method == "PUT" and credential.uid ~= firebase.ownerUid) then
+                    return nil, "Firebase UID changed; recover original Carry owner credentials"
+                end
+                result, err = request(method, url(firebase.db, "controls"), payload)
+            end
+            return result, err
+        end
         firebase.readControls = function(force)
             if not firebase.db or not credential or not credential.token or not firebase.cloudReady then
                 return nil, "Firebase not synchronized"
             end
-            if not force and firebase.controlsAt and os.clock() - firebase.controlsAt < FAST.controls then
+            if firebase.controlsBusy then return firebase.controls end
+            local now = os.clock()
+            if now < (firebase.controlsNextReadAt or 0) then
+                return firebase.controls, "Control read is cooling down after an error"
+            end
+            if not force and firebase.controlsAt and now - firebase.controlsAt < FAST.controls then
                 return firebase.controls
             end
-            local result, err = request("GET", url(firebase.db, "controls"))
+            local epoch = firebase.controlsEpoch or 0
+            local result, err = controlsRequest("GET")
+            -- An older in-flight GET must not overwrite a new Pause/Resume result.
+            if epoch ~= (firebase.controlsEpoch or 0) then return firebase.controls end
             if err then
+                local denied = err:find("HTTP 401", 1, true) or err:find("HTTP 403", 1, true)
+                firebase.controlsNextReadAt = os.clock() + (denied and 15 or 3)
                 firebase.controlsAt = os.clock()
-                firebase.controlsStatus = "Control sync failed: " .. tostring(err):sub(1, 85)
+                firebase.controlsStatus = "Control sync failed: " .. controlsError(err)
                 return nil, err
             end
             firebase.controls = type(result) == "table" and result or {paused = false}
             firebase.controlsAt = os.clock()
+            firebase.controlsNextReadAt = 0
             firebase.controlsStatus = firebase.controls.paused and "Party paused by Carry" or "Party active"
             return firebase.controls
         end
         firebase.setPaused = function(value)
+            if firebase.controlsBusy then
+                return false, "Pause/Resume request is already in progress"
+            end
+            if not firebase.db or not firebase.cloudReady then
+                return false, "Firebase Party not synchronized yet"
+            end
+            local db, key, endpointErr = endpoint()
+            if not db then return false, endpointErr end
+            -- A UI click may occur between periodic auth cycles.
+            local authed, authErr = auth(db, key)
+            if not authed then
+                firebase.controlsStatus = "Firebase login failed: " .. tostring(authErr)
+                return false, firebase.controlsStatus
+            end
             if firebase.isGuest() or not firebase.uid or firebase.uid ~= firebase.ownerUid
-                or not firebase.db or not credential or not credential.token then
-                return false, "Only authenticated Carry owner can pause/resume"
+                or not credential or not credential.token then
+                firebase.controlsStatus = "Only original Firebase Carry owner may Pause/Resume"
+                return false, firebase.controlsStatus
             end
             local desired = value == true
-            local result, err = request("PUT", url(firebase.db, "controls"), httpService:JSONEncode({
-                paused = desired, by = credential.uid, updatedAt = {[".sv"] = "timestamp"},
-            }))
+            firebase.controlsBusy = true
+            firebase.controlsEpoch += 1
+            firebase.controlsStatus = desired and "Sending Pause to Firebase..." or "Sending Resume to Firebase..."
+            local ok, result, err = pcall(function()
+                return controlsRequest("PUT", httpService:JSONEncode({
+                    paused = desired, by = credential.uid, updatedAt = {[".sv"] = "timestamp"},
+                }))
+            end)
+            firebase.controlsBusy = false
+            if not ok then
+                firebase.controlsStatus = "Pause/Resume request crashed: " .. tostring(result):sub(1, 140)
+                return false, firebase.controlsStatus
+            end
             if err then
-                firebase.controlsStatus = "Pause/Resume failed: " .. tostring(err):sub(1, 85)
-                return false, err
+                firebase.controlsNextReadAt = os.clock() + 3
+                firebase.controlsStatus = "Pause/Resume failed: " .. controlsError(err)
+                return false, firebase.controlsStatus
             end
             if type(result) ~= "table" or result.paused ~= desired then
-                return false, "Firebase did not confirm control update"
+                firebase.controlsStatus = "Firebase did not confirm control update"
+                return false, firebase.controlsStatus
             end
             firebase.controls = result
             firebase.controlsAt = os.clock()
+            firebase.controlsNextReadAt = 0
             firebase.controlsStatus = desired and "Party paused by Carry" or "Party resumed by Carry"
             return true, firebase.controlsStatus
         end
@@ -66556,6 +66640,10 @@ local components = (function()
             firebase.webhookLoaded, firebase.webhookReports = false, nil
             firebase.webhookStatus = "Reconnecting Cloud webhook"
             firebase.controlsAt = nil
+            firebase.controlsNextReadAt = 0
+            firebase.controlsAuthRetryAt = nil
+            firebase.controlsBusy = false
+            firebase.controlsEpoch = (firebase.controlsEpoch or 0) + 1
             firebase.controls = {paused = false}
             firebase.controlsStatus = "Reconnecting Cloud controls"
             firebase.analyticsReadAt, firebase.analyticsWriteAt = nil, nil
@@ -93266,12 +93354,14 @@ local components = (function()
                         local control = uiKit.status(health.content,"Cloud controls: connecting",2)
                         local action = uiKit.buttonRow(health.content,3)
                         action.add("Pause after run","plain",function()
+                            control.Text = "Sending Pause..."
                             task.spawn(function()
                                 local ok,msg=ops.setPause(true)
                                 control.Text=ok and "Paused: finish current Dungeon, do not start/replay" or tostring(msg)
                             end)
                         end,"Carry only: current Dungeon continues, no new Dungeon or Replay is started.")
                         action.add("Resume Party","accent",function()
+                            control.Text = "Sending Resume..."
                             task.spawn(function()
                                 local ok,msg=ops.setPause(false)
                                 control.Text=ok and "Resumed: automatic queueing allowed" or tostring(msg)
