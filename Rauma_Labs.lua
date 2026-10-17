@@ -89860,7 +89860,7 @@ local components = (function()
                     contextRunsThisAccount,
                     "Whitelist",
                     2,
-                    "Friends who may be in your runs. Your own accounts never need adding - they are always allowed."
+                    "Trusted usernames for Mod Detection. Copy your Party's Leech accounts here with one click; existing names are kept."
                 ).content
                 local textControl5 = uiKit.caption(C, "", 1)
                 local function B()
@@ -89913,11 +89913,11 @@ local components = (function()
                         end
                     end
                 end)
-                Y(
+                local whitelistInput = Y(
                     uiKit.listInput(
                         C,
-                        "Friends",
-                        "Usernames, not display names. A new box opens as you fill the last.",
+                        "Friends / Party Leech whitelist",
+                        "Roblox usernames (not display names). Add manually or import your Party's Leech accounts.",
                         function()
                             return config.modWhitelist
                         end,
@@ -89926,11 +89926,86 @@ local components = (function()
                             Z()
                         end,
                         2,
-                        "Players who are not your accounts but may be in your runs - a friend joining is not flagged. Empty a box to remove a name.",
-                        "Add a friend's username",
+                        "Explicitly trusted usernames. Remove a name from the input to revoke it. Import never removes existing entries.",
+                        "Add a Roblox username",
                         5
                     )
                 )
+                local whitelistImportStatus = uiKit.status(C,
+                    "Select a Party in Parties & Runs, then import its Leech usernames.", 4)
+                uiKit.button(C, "Add all Party Leech usernames", "accent", function()
+                    local af = context.AF
+                    if not af or not af.parties then
+                        whitelistImportStatus.Text = "Party manager is not ready."
+                        return
+                    end
+                    local loaded, parties = pcall(af.parties, true)
+                    if not loaded or type(parties) ~= "table" then
+                        whitelistImportStatus.Text = "Cannot read Party data yet; connect/sync Party first."
+                        return
+                    end
+                    -- Prefer the Party selected in the editor, then this account's Party.
+                    -- Never silently import Leech usernames from unrelated Parties.
+                    local selected
+                    if af.editId ~= nil then
+                        for _, party in ipairs(parties) do
+                            if type(party) == "table" and party.id == af.editId then
+                                selected = party
+                                break
+                            end
+                        end
+                    end
+                    if not selected and af.partyOf then
+                        local ok, own = pcall(af.partyOf, localPlayer.Name, af.doc)
+                        if ok and type(own) == "table" then selected = own end
+                    end
+                    if not selected and #parties == 1 then selected = parties[1] end
+                    if type(selected) ~= "table" or type(selected.accounts) ~= "table" then
+                        whitelistImportStatus.Text = "No Party selected. Open Parties and select one first."
+                        return
+                    end
+                    local names, seen = {}, {}
+                    local function addName(rawName)
+                        local name = tostring(rawName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        local key = name:gsub("^@", ""):lower()
+                        if key == "" or seen[key] then return false end
+                        seen[key] = true
+                        names[#names + 1] = name
+                        return true
+                    end
+                    for _, name in ipairs(type(config.modWhitelist) == "table" and config.modWhitelist or {}) do
+                        addName(name)
+                    end
+                    local added, found = 0, 0
+                    for _, account in ipairs(selected.accounts) do
+                        if type(account) == "table" and tostring(account.role):lower() == "leech" then
+                            local name = tostring(account.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                            -- Roblox usernames contain 3-20 letters, digits or underscores.
+                            if #name >= 3 and #name <= 20 and name:match("^[%w_]+$") then
+                                found += 1
+                                if addName(name) then added += 1 end
+                            end
+                        end
+                    end
+                    if found == 0 then
+                        whitelistImportStatus.Text = "No Leech usernames in this Party. Add Leech members in Parties first."
+                        return
+                    end
+                    if added == 0 then
+                        whitelistImportStatus.Text = ("All %d Leech username(s) are already whitelisted."):format(found)
+                        return
+                    end
+                    config.modWhitelist = names
+                    local saved = contextSaveConfig()
+                    whitelistInput.render() -- update the visible input rows immediately
+                    whitelistImportStatus.Text = ("Added %d of %d Leech username(s) | %s"):format(
+                        added, found, saved and "saved" or "save unavailable - check file permissions")
+                    if context.notify then
+                        context.notify(saved and "success" or "warning", "Mod Detection whitelist",
+                            whitelistImportStatus.Text)
+                    end
+                end, 3,
+                    "Copy Leech-role usernames from the selected Party into this device's Mod Detection whitelist. Keeps existing names, skips duplicates and Carry; saves locally.")
                 local content = uiKit.section(
                     contextRunsThisAccount,
                     "After a big drop",
