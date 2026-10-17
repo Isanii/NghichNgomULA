@@ -66560,6 +66560,28 @@ local components = (function()
             firebase.checkNow()
             return true, "Checking requests against enabled Party accounts"
         end
+        firebase.setup = {}
+        firebase.setup.beginCarry = function()
+            if config.firebaseRole ~= "carry" then
+                return false, "Select Carry role first"
+            end
+            if firebase.ownerMismatch then return false, firebase.ownerMismatch end
+            if not context.AF or not context.AF.ensureCarryLeader then
+                return false, "Party module is not ready"
+            end
+            local ok, reason = context.AF.ensureCarryLeader(true)
+            if ok then firebase.checkNow() end
+            return ok, reason
+        end
+        firebase.setup.refreshInbox = function()
+            return firebase.refreshRequests()
+        end
+        firebase.setup.approve = function(uid)
+            return firebase.approve(uid)
+        end
+        firebase.setup.retryGuest = function()
+            return firebase.retryPairing()
+        end
         firebase.retryPairing = function()
             if config.firebaseRole == "carry" then
                 return false, "This account is set as Firebase Carry. Use Recover Carry owner if UID has changed."
@@ -66645,7 +66667,15 @@ local components = (function()
                 party.loadReal(true)
                 local account = enabledMember(party.doc, player.Name)
                 if not account or account.role ~= "leader" then
-                    return nil, "Carry: create a Party and make this account its leader first"
+                    local ready, reason = party.ensureCarryLeader()
+                    if not ready then
+                        return nil, "Carry Party setup: " .. tostring(reason)
+                    end
+                    party.loadReal(true)
+                    account = enabledMember(party.doc, player.Name)
+                end
+                if not account or account.role ~= "leader" then
+                    return nil, "Carry Party has no enabled leader - check the crown and save status"
                 end
                 owner, err = request("PUT", url(db, "owner"), httpService:JSONEncode({
                     uid = credential.uid, name = player.Name, createdAt = {[".sv"] = "timestamp"},
@@ -66782,7 +66812,7 @@ local components = (function()
                     firebase.requestAt = os.clock()
                     firebase.pairingStatus = "Request uploaded and verified; waiting for " .. owner.name .. " to Approve"
                 end
-                return nil, "Pairing request sent - waiting for Carry to approve " .. player.Name
+                return nil, tostring(firebase.pairingStatus or ("Waiting for Carry to approve " .. player.Name))
             end
             firebase.pairingStatus = "Approved by Carry; synchronizing Party"
             local payload, readErr = request("GET", url(db, "party"))
@@ -67121,6 +67151,14 @@ local components = (function()
                 return nil, explanation
             end
             local guest = firebase.isGuest()
+            -- Pairing inbox is independent of Party publish. Never hide new requests
+            -- just because the local Party file is missing or still being edited.
+            if not guest and (not firebase.pendingClock or os.clock() - firebase.pendingClock >= 7) then
+                party.loadReal(true)
+                local inboxOK, inboxErr = pendingRequests(db, party)
+                if not inboxOK then return nil, inboxErr end
+                firebase.pendingClock = os.clock()
+            end
             local ready, partyErr
             if guest then ready, partyErr = guestParty(db, party, owner)
             else ready, partyErr = publishParty(db, party) end
@@ -67134,11 +67172,6 @@ local components = (function()
                 local presOK, presErr = allPresence(db, party)
                 if not presOK then return nil, presErr end
                 firebase.presenceClock = os.clock()
-            end
-            if not guest and (not firebase.pendingClock or os.clock() - firebase.pendingClock >= 9) then
-                local pendingOK, pendingErr = pendingRequests(db, party)
-                if not pendingOK then return nil, pendingErr end
-                firebase.pendingClock = os.clock()
             end
             if not guest and firebase.backupRefresh ~= credential.refresh then
                 if firebase.backupOwner() then firebase.backupRefresh = credential.refresh end
@@ -68677,16 +68710,21 @@ local components = (function()
             partyQueue.noList = J
             return J
         end
-        partyQueue.save = function()
+        partyQueue.canEdit = function()
             if context.FirebaseSync and context.FirebaseSync.mustUseCloudDocument
                 and context.FirebaseSync.mustUseCloudDocument() then
-                if partyQueue.cloudRaw then
-                    local ok, cloudDoc = pcall(httpService.JSONDecode, httpService, partyQueue.cloudRaw)
-                    if ok and type(cloudDoc) == "table" then
-                        partyQueue.applyCloudDocument(cloudDoc, partyQueue.cloudRevision)
-                    end
-                end
-                return
+                return false, "Leech receives the Cloud Party from Carry; edit it on Carry instead"
+            end
+            if context.FirebaseSync and context.FirebaseSync.ownerMismatch then
+                return false, "Owner mismatch: recover the original Carry Firebase identity first"
+            end
+            return true
+        end
+        partyQueue.save = function()
+            local allowed, reason = partyQueue.canEdit()
+            if not allowed then
+                partyQueue.lastSaveError = reason
+                return false, reason
             end
             local p = partyQueue.loadReal()
             if not partyQueue.doc then
@@ -68704,13 +68742,25 @@ local components = (function()
                 local doc = partyQueue.doc
                 return httpService:JSONEncode(doc)
             end)
-            if success then
-                pcall(writefile, partyQueue.file, raw)
-                partyQueue.raw = raw
+            if not success or type(raw) ~= "string" then
+                partyQueue.lastSaveError = "Cannot encode Party configuration"
+                return false, partyQueue.lastSaveError
             end
+            if type(writefile) ~= "function" then
+                partyQueue.lastSaveError = "Executor cannot write Party file"
+                return false, partyQueue.lastSaveError
+            end
+            local wrote, result = pcall(writefile, partyQueue.file, raw)
+            if not wrote or result == false then
+                partyQueue.lastSaveError = "Could not save Party file: " .. tostring(result)
+                return false, partyQueue.lastSaveError
+            end
+            partyQueue.lastSaveError = nil
+            partyQueue.raw = raw
             partyQueue.cfg = E()
             partyQueue.cfgAt = os.clock()
             if context.FirebaseSync and context.FirebaseSync.checkNow then context.FirebaseSync.checkNow() end
+            return true
         end
         partyQueue.parties = function(E)
             partyQueue.loadReal(E)
@@ -68754,16 +68804,54 @@ local components = (function()
                 partyQueue.editId = p[E].id
             end
         end
+        partyQueue.ensureCarryLeader = function(allowRepair)
+            local allowed, reason = partyQueue.canEdit()
+            if not allowed then return false, reason end
+            partyQueue.loadReal(true)
+            local existing = partyQueue.partyOf(localPlayer.Name, partyQueue.doc)
+            if existing then
+                local mine = partyQueue.entry(localPlayer.Name, existing)
+                if mine and mine.role == "leader" and mine.enabled ~= false then
+                    partyQueue.editId = existing.id
+                    return true, "Carry Party leader is ready"
+                end
+                if allowRepair and mine then
+                    for _, account in ipairs(existing.accounts) do
+                        if account ~= mine and account.role == "leader" then
+                            account.role = "fight"
+                        end
+                    end
+                    mine.role, mine.enabled = "leader", true
+                    local saved, saveError = partyQueue.save()
+                    if not saved then return false, saveError end
+                    partyQueue.editId = existing.id
+                    return true, "Repaired Party: this Carry is now the enabled leader"
+                end
+                return false, "This account is in a Party but not its leader; choose Repair Carry Party."
+            end
+            local group, result = partyQueue.soloParty()
+            if not group then return false, tostring(result or "Failed to create Carry Party") end
+            return true, "Created Carry Party with " .. localPlayer.Name .. " as leader"
+        end
         partyQueue.newParty = function()
+            local allowed, reason = partyQueue.canEdit()
+            if not allowed then return nil, reason end
             partyQueue.editParty(true)
             local parties, p = partyQueue.doc.parties, partyQueue.defaults()
             p.v, p.id = 2, d()
             parties[#parties + 1] = p
             partyQueue.editId = p.id
-            partyQueue.save()
+            local ok, err = partyQueue.save()
+            if not ok then
+                table.remove(parties, #parties)
+                partyQueue.editId = nil
+                return nil, err
+            end
             return p, #parties
         end
         partyQueue.soloParty = function(E)
+            local allowed, reason = partyQueue.canEdit()
+            if not allowed then return nil, reason end
             partyQueue.loadReal(true)
             if not partyQueue.doc then
                 partyQueue.doc = {
@@ -68802,7 +68890,8 @@ local components = (function()
                 end
             end
             partyQueue.editId = j.id
-            partyQueue.save()
+            local ok, err = partyQueue.save()
+            if not ok then return nil, err end
             return j
         end
         partyQueue.deleteParty = function(d)
@@ -73978,9 +74067,7 @@ local components = (function()
                 holder = section2,
                 content = content,
                 setOpen = function(M, n)
-                    if not M then
-                        setOpen(false, n)
-                    end
+                    setOpen(M == true, n)
                 end,
                 isOpen = function()
                     local visible2 = visible
@@ -74005,6 +74092,17 @@ local components = (function()
                 _.TextWrapped = true
                 _.TextYAlignment = Enum.TextYAlignment.Top
                 return _
+            end,
+            status = function(Q, S, P)
+                local textLabel = label(Q, S, "rowStat", P)
+                textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+                textLabel:SetAttribute("RaumaThemeSkipTree", true)
+                textLabel.TextSize = 14
+                textLabel.TextWrapped = true
+                textLabel.TextYAlignment = Enum.TextYAlignment.Top
+                textLabel.AutomaticSize = Enum.AutomaticSize.Y
+                textLabel.Size = UDim2.new(1, -2, 0, 0)
+                return textLabel
             end,
             flexFill = flexFill,
             accentGradient = accentGradient,
@@ -92773,8 +92871,18 @@ local components = (function()
                 do
                     local fb = context.FirebaseSync
                     local section = uiKit.section(g, "Firebase Sync", -10,
-                        "Enter Firebase URL and API Key once per PC. Carry owns the Party and approves each Leech once.")
-                    Y(uiKit.dropdown(section.content, "Firebase role", {
+                        "Cloud setup > Party leader > Pairing approval > Live status. Configure Carry before Leech.")
+                    local connectSection = uiKit.section(section.content, "1. Connect & Carry setup", 0,
+                        "URL/API Key are shared per device; Firebase owner UID remains private per Roblox account.")
+                    local pairingSection = uiKit.section(section.content, "2. Pairing & approval", 1,
+                        "Carry must have a valid leader Party. Leech sends a request and Carry approves once.")
+                    local diagnosticsSection = uiKit.section(section.content, "3. Status & diagnostics", 2,
+                        "Readable live status and actionable Firebase errors.")
+                    section.setOpen(true)
+                    connectSection.setOpen(true)
+                    pairingSection.setOpen(true)
+                    diagnosticsSection.setOpen(true)
+                    Y(uiKit.dropdown(connectSection.content, "Firebase role", {
                         {value = "leech", label = "Leech / member"},
                         {value = "carry", label = "Carry - project owner"},
                     }, function() return config.firebaseRole or "leech" end, function(value)
@@ -92783,7 +92891,7 @@ local components = (function()
                         fb.reconnect()
                     end, 0, "Carry role must match the saved Firebase owner UID; switching the dropdown does not transfer ownership. A Carry owner mismatch needs a recovery credential backup. Other accounts use Leech / member."))
                     local sharedSettings = context.FirebaseShared
-                    local sharedUrlInput = uiKit.textInput(section.content, "Realtime Database URL", function()
+                    local sharedUrlInput = uiKit.textInput(connectSection.content, "Realtime Database URL", function()
                         return config.firebaseDatabaseUrl or ""
                     end, function(value)
                         if sharedSettings and sharedSettings.set then
@@ -92796,7 +92904,7 @@ local components = (function()
                     end, 1, "Shared automatically across Roblox tabs on this PC. Saved to firebase_shared.json.",
                         "https://project-default-rtdb.asia-southeast1.firebasedatabase.app")
                     Y(sharedUrlInput)
-                    local sharedKeyInput = uiKit.textInput(section.content, "Web API Key", function()
+                    local sharedKeyInput = uiKit.textInput(connectSection.content, "Web API Key", function()
                         return config.firebaseApiKey or ""
                     end, function(value)
                         if sharedSettings and sharedSettings.set then
@@ -92816,19 +92924,27 @@ local components = (function()
                             sharedKeyInput.render()
                         end
                     end
-                    Y(uiKit.toggle(section.content, "Auto find and join Carry server", function()
+                    Y(uiKit.toggle(connectSection.content, "Auto find and join Carry server", function()
                         return config.firebaseAutoJoin == true
                     end, function(value) fb.setAutoJoin(value) end, 3,
                     "This account only. Off still syncs Party and account status. On follows the Party leader to its lobby; it does not interrupt your current run or bypass private-server restrictions."))
-                    local joinStatus = uiKit.caption(section.content, "Join: off", 4)
-                    local perfStatus = uiKit.caption(section.content, "Actions: idle | Firebase requests: 0", 15)
-                    uiKit.button(section.content, "Refresh Party and status", "plain", function()
+                    local joinStatus = uiKit.status(diagnosticsSection.content, "Join: off", 4)
+                    local perfStatus = uiKit.status(diagnosticsSection.content, "Actions: idle | Firebase requests: 0", 15)
+                    uiKit.button(diagnosticsSection.content, "Refresh Party and status", "plain", function()
                         fb.checkNow()
                     end, 5, "Request the next Firebase refresh now.")
-                    uiKit.caption(section.content,
+                    uiKit.caption(diagnosticsSection.content,
                         "Running: heartbeat within 20s. Delayed: 20-45s. Offline: over 45s. Unknown: this client cannot reach Firebase.", 6)
-                    local recoveryRow = uiKit.buttonRow(section.content, 13)
-                    local recoveryStatus = uiKit.caption(section.content, "Owner recovery: keep a private backup of the recovery file.", 14)
+                    local setupNote = uiKit.status(connectSection.content,
+                        "Carry: create or verify your leader Party, then wait for Firebase connection.", 5)
+                    local beginCarry = uiKit.buttonRow(connectSection.content, 6)
+                    beginCarry.add("Create / Repair Carry Party", "accent", function()
+                        local ok, message = fb.setup.beginCarry()
+                        setupNote.Text = tostring(message)
+                        if ok then contextRefreshAll() end
+                    end, "Carry only. If you changed Firebase project or lost owner credentials, use recovery instead.")
+                    local recoveryRow = uiKit.buttonRow(pairingSection.content, 13)
+                    local recoveryStatus = uiKit.status(pairingSection.content, "Owner recovery: keep a private backup of the recovery file.", 14)
                     recoveryRow.add("Backup Carry owner", "plain", function()
                         local ok, message = fb.backupOwner()
                         recoveryStatus.Text = message or (ok and "Backup saved" or "Backup failed")
@@ -92843,28 +92959,28 @@ local components = (function()
                             contextRefreshAll()
                         end)
                     end, "Restore the same Firebase UID and Party from owner_recovery_<RobloxUserId>.json. Requires the original Roblox account and Firebase project.")
-                    local fbStatus = uiKit.caption(section.content, "Firebase: off", 7)
-                    local fbUid = uiKit.caption(section.content, "Your Firebase UID: not connected", 8)
-                    local fbCloud = uiKit.caption(section.content, "Cloud Party: off", 9)
-                    local fbShared = uiKit.caption(section.content, "Local Firebase settings: checking", 10)
-                    local pairing = uiKit.caption(section.content, "Pairing: waiting for Carry", 11)
-                    local pairingDetails = uiKit.caption(section.content, "Pairing diagnostics: checking", 16)
-                    local pairingActions = uiKit.buttonRow(section.content, 17)
+                    local fbStatus = uiKit.status(diagnosticsSection.content, "Firebase: off", 7)
+                    local fbUid = uiKit.status(diagnosticsSection.content, "Your Firebase UID: not connected", 8)
+                    local fbCloud = uiKit.status(diagnosticsSection.content, "Cloud Party: off", 9)
+                    local fbShared = uiKit.status(diagnosticsSection.content, "Local Firebase settings: checking", 10)
+                    local pairing = uiKit.status(pairingSection.content, "Pairing: waiting for Carry", 11)
+                    local pairingDetails = uiKit.status(pairingSection.content, "Pairing diagnostics: checking", 16)
+                    local pairingActions = uiKit.buttonRow(pairingSection.content, 17)
                     pairingActions.add("Retry Leech request", "plain", function()
-                        local ok, message = fb.retryPairing()
+                        local ok, message = fb.setup.retryGuest()
                         pairingDetails.Text = tostring(message)
                         if not ok and context.notify then context.notify("warning", "Firebase Pairing", tostring(message)) end
                     end, "Leech only: resend your pairing request and show Firebase permissions errors.")
                     pairingActions.add("Refresh Carry requests", "plain", function()
-                        local ok, message = fb.refreshRequests()
+                        local ok, message = fb.setup.refreshInbox()
                         pairingDetails.Text = tostring(message)
                     end, "Carry: re-read requests now, including the count rejected by roster filters.")
-                    local actionRow = uiKit.buttonRow(section.content, 12)
+                    local actionRow = uiKit.buttonRow(pairingSection.content, 12)
                     actionRow.add("Approve next Leech", "accent", function()
                         local nextRequest = fb.pending and fb.pending[1]
                         if nextRequest then
                             task.spawn(function()
-                                local ok, err = fb.approve(nextRequest.uid)
+                                local ok, err = fb.setup.approve(nextRequest.uid)
                                 if context.notify then
                                     context.notify(ok and "success" or "warning", "Cloud Party",
                                         ok and ("Approved " .. nextRequest.name) or tostring(err))
@@ -92885,7 +93001,7 @@ local components = (function()
                                 gate and gate.blocked or 0, counters.total or 0,
                                 counters.failed or 0, counters.lastMs or 0)
                             fbStatus.Text = "Firebase: " .. tostring(fb.status)
-                            fbUid.Text = "Own UID (diagnostics): " .. tostring(fb.uid or "not connected")
+                            fbUid.Text = "Firebase identity: " .. tostring(fb.uid or "not connected"):sub(1, 12)
                             fbCloud.Text = "Cloud Party: " .. (fb.cloudReady and "synced" or "waiting / disconnected")
                             fbShared.Text = "Local Firebase settings: " .. tostring(sharedSettings and sharedSettings.status or "unavailable")
                             local nextRequest = fb.pending and fb.pending[1]
@@ -92967,11 +93083,16 @@ local components = (function()
                         ))
                     end
                     H.add("New", "plain", function()
-                        partyQueue.newParty()
+                        local created, errorOrIndex = partyQueue.newParty()
+                        if not created then
+                            textControl13.Text = "Party create failed: " .. tostring(errorOrIndex)
+                            textControl13.Visible = true
+                            return
+                        end
                         s = nil
                         G()
                         contextRefreshAll()
-                    end, "Start another party with its own accounts, leader and dungeon.")
+                    end, "Create another Party. Only the Carry may edit the Cloud Party.")
                 end
                 local z = ""
                 local W = uiKit.textInput(contextRunsThisAccount.content, "Username", function()
@@ -92980,7 +93101,7 @@ local components = (function()
                 end, function(K)
                     z = tostring(K or "")
                 end, 1, "The account's Roblox username - not its display name.", "roblox username")
-                local textControl13 = uiKit.caption(contextRunsThisAccount.content, "", 3)
+                local textControl13 = uiKit.status(contextRunsThisAccount.content, "", 3)
                 textControl13.Visible = false
                 local altRows = Instance.new("Frame")
                 altRows.Name = "AltRows"
@@ -93004,8 +93125,18 @@ local components = (function()
                             return e().on == true
                         end,
                         function(X)
+                            local allowed, reason = partyQueue.canEdit()
+                            if not allowed then
+                                textControl13.Text = tostring(reason)
+                                textControl13.Visible = true
+                                return
+                            end
                             e(true).on = X == true
-                            partyQueue.save()
+                            local saved, errorText = partyQueue.save()
+                            if not saved then
+                                textControl13.Text = "Run Party could not save: " .. tostring(errorText)
+                                textControl13.Visible = true
+                            end
                             pcall(context.refreshQueueMode)
                         end,
                         7,
@@ -93018,8 +93149,8 @@ local components = (function()
                     if ops then
                         local health = uiKit.section(g,"Party Health & Controls",1,
                             "Cross-PC heartbeat, Party status, and a Carry-only Cloud Pause/Resume.")
-                        local live = uiKit.caption(health.content,"Loading Party Health...",1)
-                        local control = uiKit.caption(health.content,"Cloud controls: connecting",2)
+                        local live = uiKit.status(health.content,"Loading Party Health...",1)
+                        local control = uiKit.status(health.content,"Cloud controls: connecting",2)
                         local action = uiKit.buttonRow(health.content,3)
                         action.add("Pause after run","plain",function()
                             task.spawn(function()
@@ -93055,20 +93186,20 @@ local components = (function()
                         end,function(value)
                             config.opsAlerts=value==true; contextSaveConfig()
                         end,4,"Carry sends a rate-limited alert for a member who was online then lost heartbeat. Requires webhook URL."))
-                        local recover = uiKit.caption(safe.content,"Recovery: waiting for sync",5)
-                        local alertView = uiKit.caption(safe.content,"Alerts: off",6)
+                        local recover = uiKit.status(safe.content,"Recovery: waiting for sync",5)
+                        local alertView = uiKit.status(safe.content,"Alerts: off",6)
                         local prog = uiKit.section(g,"Progress & Analytics",6,
                             "Next level milestone and cross-PC session summaries via existing heartbeats.")
-                        local nextLevel=uiKit.caption(prog.content,"Waiting for level data",1)
+                        local nextLevel=uiKit.status(prog.content,"Waiting for level data",1)
                         Y(uiKit.toggle(prog.content,"Track Party analytics",function()
                             return config.opsAnalytics~=false
                         end,function(value)
                             config.opsAnalytics=value==true; contextSaveConfig()
                         end,2,"Save local account run counts, wins, durations and level gains; Carry reads summaries from Firebase."))
-                        local stats=uiKit.caption(prog.content,"No reports received",3)
+                        local stats=uiKit.status(prog.content,"No reports received",3)
                         local backup=uiKit.section(g,"Party Backup & Restore",7,
                             "Carry-only configuration snapshots. Never saves Firebase tokens or Discord webhook URLs.")
-                        local backupView=uiKit.caption(backup.content,"No backup yet",1)
+                        local backupView=uiKit.status(backup.content,"No backup yet",1)
                         local backups=uiKit.buttonRow(backup.content,2)
                         backups.add("Backup now","plain",function()
                             local ok,msg=ops.backup(); backupView.Text=tostring(msg)
@@ -93111,6 +93242,14 @@ local components = (function()
                     return false
                 end
                 local function QF(name)
+                    local allowed, reason = partyQueue.canEdit()
+                    if not allowed then return false, reason end
+                    -- If the Carry is establishing its first Party, it must lead it.
+                    if config.firebaseRole == "carry" and context.FirebaseSync
+                        and not context.FirebaseSync.ownerMismatch then
+                        local ready, setupError = partyQueue.ensureCarryLeader()
+                        if not ready then return false, setupError end
+                    end
                     local OF = e(true)
                     if partyQueue.entry(name, OF) then
                         return false, "is already in this party"
@@ -93141,9 +93280,13 @@ local components = (function()
                         dF(LF .. " " .. tostring(SF) .. ".")
                         return
                     end
-                    partyQueue.save()
+                    local saved, saveError = partyQueue.save()
+                    if not saved then
+                        dF("Save failed: " .. tostring(saveError))
+                        return
+                    end
                     z, W.box.Text = "", ""
-                    dF("")
+                    dF("Account added and Party saved. Carry will publish on next sync.")
                     G()
                 end
                 local addAccount, LF =
