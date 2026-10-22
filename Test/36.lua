@@ -1440,6 +1440,7 @@ secondbossdirectshot = {
             lastClick = -math.huge,
         }
         local function contextLog(J, w)
+            
             if config.debugPrints then
                 print(("[DQ %s][%s] %s"):format("Rauma Labs - Gilded Skies", J, w))
             end
@@ -36697,6 +36698,7 @@ end
         local function DF(PF)
             if (PF == Enum.KeyCode.Q or PF == Enum.KeyCode.E)
                 and not context.GS.allowAbilityKey(PF == Enum.KeyCode.Q and "q" or "e") then return false end
+            
             if
                 runtimeState.swapHoldUntil
                 and os.clock() < runtimeState.swapHoldUntil
@@ -55668,6 +55670,7 @@ end
                     j[key] = type(entry) == "table" and entry or tostring(entry)
                 end
                 local E = game:GetService("HttpService"):JSONEncode(j)
+                
                 if config.devLogs == true then
                     appendfile("Rauma_Labs/logs/queue.jsonl", E .. "\10")
                 end
@@ -55998,7 +56001,18 @@ end
                 lB.rodinFinishedAt = nil
                 lB.rodinWasAlive = nil
                 if u then
-                    pcall(context.AF.lobbyTick, j)
+                    local partyOK, partyError = pcall(context.AF.lobbyTick, j)
+                    if not partyOK then
+                        local message = "party: " .. tostring(partyError)
+                        runtimeState.lastError, runtimeState.lastErrorAt = message, j
+                        context.AF.status = message
+                        h(message)
+                        if context.logT then context.logT("party-error", 10, "Party", message) end
+                        if context.notify and j - (lB.partyErrorAt or -math.huge) >= 10 then
+                            lB.partyErrorAt = j
+                            context.notify("error", "Party error", tostring(partyError))
+                        end
+                    end
                     return
                 end
                 h("not in a running party - runs start from a party (Parties & Runs)")
@@ -56610,30 +56624,36 @@ end
             return J
         end
         partyQueue.save = function()
-            
-            local p = partyQueue.loadReal()
+            local selected = partyQueue.loadReal()
             if not partyQueue.doc then
-                if type(p.id) ~= "string" then
-                    p.id = d()
-                end
-                partyQueue.doc = {
-                    v = 2,
-                    parties = {
-                        p,
-                    },
-                }
+                if type(selected.id) ~= "string" then selected.id = d() end
+                partyQueue.doc = {v = 2, parties = {selected}}
             end
-            local success, raw = pcall(function()
-                local doc = partyQueue.doc
-                return httpService:JSONEncode(doc)
-            end)
-            if success then
-                pcall(writefile, partyQueue.file, raw)
+            local ok, message = pcall(function()
+                if type(writefile) ~= "function" then error("Executor cannot write shared Party files") end
+                if context.ensureFolders then context.ensureFolders() end
+                local raw = httpService:JSONEncode(partyQueue.doc)
+                writefile(partyQueue.file, raw)
+                -- Only a completed write may become the synchronization baseline.
                 partyQueue.raw = raw
+            end)
+            partyQueue.cfg, partyQueue.cfgAt = E(), os.clock()
+            if not ok then
+                partyQueue.saveError = tostring(message)
+                partyQueue.status = "Could not save Party: " .. partyQueue.saveError
+                if context.log then context.log("Party", partyQueue.status) end
+                local now = os.clock()
+                if context.notify and now - (partyQueue.saveErrorAt or -math.huge) >= 10 then
+                    partyQueue.saveErrorAt = now
+                    context.notify("error", "Party was not saved", partyQueue.saveError)
+                end
+                return false, partyQueue.saveError
             end
-            partyQueue.cfg = E()
-            partyQueue.cfgAt = os.clock()
+            partyQueue.saveError = nil
+            partyQueue.planCache = nil
+            return true
         end
+
         partyQueue.parties = function(E)
             partyQueue.loadReal(E)
             return partyQueue.doc and partyQueue.doc.parties or {}
@@ -57757,16 +57777,7 @@ end
         partyQueue.carryTick = function(S)
             
             local u = partyQueue.load()
-            if partyQueue.allAtNewSave() then
-                
-                if S - nil < 120 then
-                    p("the leechers are starting their new saves - holding the party")
-                    partyQueue.restartWait()
-                    return
-                end
-            else
-                
-            end
+            
             if partyQueue.leaderRejoinTick and partyQueue.leaderRejoinTick(S) then
                 return
             end
@@ -57956,7 +57967,7 @@ end
                 end)
                 
                 task.spawn(function()
-                    if runtimeState.destroyed or nil then
+                    if runtimeState.destroyed or runtimeState.modHalt or partyQueue.saveError or partyQueue.role() == nil then
                         return
                     end
                     local success, res = pcall(A.InvokeServer, A, map, diff, req, hardcore, true, false)
@@ -58144,7 +58155,7 @@ end
             if d then
                 
                 task.spawn(function()
-                    if runtimeState.destroyed or nil then
+                    if runtimeState.destroyed or runtimeState.modHalt or partyQueue.saveError or partyQueue.role() == nil then
                         return
                     end
                     pcall(d.InvokeServer, d, h.Name)
@@ -58206,6 +58217,10 @@ end
             end
         end)
         partyQueue.lobbyTick = function(d)
+            if partyQueue.saveError then
+                p("Could not save Party: " .. partyQueue.saveError)
+                return
+            end
             
             local L = partyQueue.role()
             if not L then
@@ -65351,6 +65366,12 @@ end
             end
             
             pcall(contextSaveConfig)
+            pcall(function()
+                
+            end)
+            pcall(function()
+                
+            end)
             for index, contextSliderConnection in ipairs(contextSliderConnections) do
                 pcall(contextSliderConnection.Disconnect, contextSliderConnection)
             end
@@ -68032,7 +68053,7 @@ end
             end
             return k
         end
-        local function contextBugGui()
+        local function uiRuntimeResult()
             local parent = localPlayer:WaitForChild("PlayerGui")
             local contextRunsThisAccount = parent:FindFirstChild("RaumaLabsUI")
             if contextRunsThisAccount then
@@ -71868,8 +71889,8 @@ end
                 context.SCRIPT_BUILD_DATE
             )
         )
-        local bugButton, band2 = pcall(contextLoadConfig)
-        if not bugButton then
+        local uiRuntimeValue, band2 = pcall(contextLoadConfig)
+        if not uiRuntimeValue then
             runtimeState.lastError, runtimeState.lastErrorAt =
                 "config load failed, using defaults: " .. tostring(band2), os.clock()
             context.log("Config", "could not be loaded (" .. tostring(band2) .. ") - running on defaults")
@@ -72251,11 +72272,12 @@ end
             end
         end)
 
-        contextBugGui()
+        uiRuntimeResult()
         context.readerStart()
         if context.fireLoop then
             context.fireLoop()
         end
+        
         do
             local httpService6 = game:GetService("HttpService")
             local mD = {
@@ -73650,12 +73672,12 @@ end
                 contextSliderConnections[#contextSliderConnections + 1] = mD.lootConn
             end
             pcall(mD.hookLoot)
-            contextBugGui = mD.canFiles and context.readJson and context.readJson(mD.file())
-            if type(contextBugGui) == "table" and (tonumber(contextBugGui.holdUntil) or 0) > os.time() then
-                mD.hold = contextBugGui
+            uiRuntimeResult = mD.canFiles and context.readJson and context.readJson(mD.file())
+            if type(uiRuntimeResult) == "table" and (tonumber(uiRuntimeResult.holdUntil) or 0) > os.time() then
+                mD.hold = uiRuntimeResult
             end
-            if type(contextBugGui) == "table" and tonumber(contextBugGui.restEndedAt) then
-                mD.restEndedAt = tonumber(contextBugGui.restEndedAt)
+            if type(uiRuntimeResult) == "table" and tonumber(uiRuntimeResult.restEndedAt) then
+                mD.restEndedAt = tonumber(uiRuntimeResult.restEndedAt)
             end
             success2, band2 = false
             if mD.canFiles then
@@ -73914,11 +73936,11 @@ end
             }
             zone.theme = theme2
             theme2.Orb = theme2.Green
-            success2, contextBugGui = pcall(function()
+            success2, uiRuntimeResult = pcall(function()
                 return context.themeAccent and context.themeAccent()
             end)
-            if success2 and typeof(contextBugGui) == "Color3" then
-                theme2.Green = contextBugGui
+            if success2 and typeof(uiRuntimeResult) == "Color3" then
+                theme2.Green = uiRuntimeResult
             end
             local V = {}
             pcall(function()
@@ -77418,7 +77440,7 @@ end
                 end
             end)
         end
-        contextBugGui, band2 = pcall(function()
+        uiRuntimeResult, band2 = pcall(function()
             local L, O, u = getgenv and getgenv() or _G, "__RaumaClassicMinimapPlus", "Rauma_Labs/configs/classic_minimap_plus.json"
             if type(L[O]) == "table" and type(L[O].destroy) == "function" then
                 pcall(L[O].destroy)
@@ -78845,7 +78867,7 @@ end
                 end
             end)
         end)
-        if not contextBugGui then
+        if not uiRuntimeResult then
             warn("[Classic Plus] " .. tostring(band2))
         end
         do
@@ -78896,8 +78918,8 @@ end
                 label.Parent = raumaRestCard
                 return label
             end
-            contextBugGui = Color3.fromRGB(135, 240, 130)
-            local textControl31 = E(9, 26, 24, contextBugGui, Enum.FontWeight.Bold)
+            uiRuntimeResult = Color3.fromRGB(135, 240, 130)
+            local textControl31 = E(9, 26, 24, uiRuntimeResult, Enum.FontWeight.Bold)
             local textControl32 = E(35, 36, 32, Color3.fromRGB(255, 255, 255), Enum.FontWeight.ExtraBold)
             local textControl33 = E(72, 22, 18, Color3.fromRGB(255, 255, 255), Enum.FontWeight.Bold)
             local requeueNow = Instance.new("TextButton")
@@ -78910,7 +78932,7 @@ end
             requeueNow.ZIndex = 7
             requeueNow.Visible = false
             requeueNow.BackgroundColor3 = Color3.fromRGB(62, 62, 62)
-            requeueNow.TextColor3 = contextBugGui
+            requeueNow.TextColor3 = uiRuntimeResult
             requeueNow.TextSize = 18
             V(requeueNow, Enum.FontWeight.Bold)
             requeueNow.Parent = raumaRestCard
@@ -78919,7 +78941,7 @@ end
             E.Parent = requeueNow
             E = Instance.new("UIStroke")
             E.Color, E.Thickness, E.Transparency, E.ApplyStrokeMode =
-                contextBugGui, 1.5, 0.2, Enum.ApplyStrokeMode.Border
+                uiRuntimeResult, 1.5, 0.2, Enum.ApplyStrokeMode.Border
             E.Parent = requeueNow
             local function V()
                 requeueNow.BackgroundColor3 = Color3.fromRGB(78, 78, 78)
@@ -79252,16 +79274,16 @@ end
                 },
             }
         end
-        bugButton = {
+        uiRuntimeValue = {
             since = os.clock(),
             sets = {
 other = newSet()
 },
         }
-        bugButton.cur = bugButton.sets.other
-        bugButton.newSet = newSet
-        runtimeState.perf = bugButton
-        _G.RaumaLabsPerf = bugButton
+        uiRuntimeValue.cur = uiRuntimeValue.sets.other
+        uiRuntimeValue.newSet = newSet
+        runtimeState.perf = uiRuntimeValue
+        _G.RaumaLabsPerf = uiRuntimeValue
         context.perfAdd = function(O, l, max)
             local h = O[l]
             if not h then
@@ -79593,8 +79615,8 @@ other = newSet()
                     d(context.BB, entry32, "BB." .. entry32)
                 end
             end
-            bugButton = { "spiralList", "spiralArms", "spiralWalkBad", "spiralRedOn", "groupPlan" }
-            for index30, entry33 in ipairs(bugButton) do
+            uiRuntimeValue = { "spiralList", "spiralArms", "spiralWalkBad", "spiralRedOn", "groupPlan" }
+            for index30, entry33 in ipairs(uiRuntimeValue) do
                 d(context, entry33, entry33)
             end
         end
