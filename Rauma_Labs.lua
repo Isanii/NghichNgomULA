@@ -1329,6 +1329,7 @@ local components = (function()
                 autoStartDungeon = false,
                 autoStartDelay = 2,
                 autoStartWalkMax = 60,
+                startWhenLoaded = true,
                 startTimed = true,
                 startCountdown = 5,
                 preWalkSprint = true,
@@ -2016,6 +2017,7 @@ local components = (function()
                 "autoQueueReplay",
                 "autoQueueDelay",
                 "autoStartDungeon",
+                "startWhenLoaded",
                 "bonusBoss",
                 "streamer",
                 "streamerName",
@@ -77727,7 +77729,7 @@ end
             return lB.pm or nil
         end
         local function u()
-            if context.AF and context.AF.relayEnabled and game.PlaceId == 77649408247578 then
+            if game.PlaceId == 77649408247578 then
                 return "Lobby"
             end
             local h = c()
@@ -77756,6 +77758,86 @@ end
             local q = (y or contextWorkspace):FindFirstChild(R)
             return q and q:IsA("ValueBase") and q or nil
         end
+        -- BEGIN RAUMA START GUARD
+        local startGuard = { lobbyPlaceId = 77649408247578 }
+        local function resetStartReady(reason)
+            startGuard.readyState = nil
+            return false, reason
+        end
+        local function startIsTeleporting()
+            local flag = localPlayer:FindFirstChild("teleporting")
+            return flag ~= nil and flag:IsA("BoolValue") and flag.Value == true
+        end
+        startGuard.canQueue = function()
+            return not runtimeState.destroyed
+                and not runtimeState.modHalt
+                and not (context.MD and context.MD.halted)
+                and game:IsLoaded()
+                and game.PlaceId == startGuard.lobbyPlaceId
+                and not startIsTeleporting()
+        end
+        startGuard.dungeonReady = function(now)
+            if runtimeState.destroyed or runtimeState.modHalt or context.MD and context.MD.halted then
+                return resetStartReady("start held by mod detection or shutdown")
+            end
+            if not game:IsLoaded() or game.PlaceId == startGuard.lobbyPlaceId or u() == "Lobby"
+                or startIsTeleporting() then
+                return resetStartReady("waiting to enter the dungeon")
+            end
+            local map = D("dungeonName")
+            local started = D("dungeonStarted")
+            local dungeon = contextWorkspace:FindFirstChild("dungeon")
+            if not (map and map:IsA("StringValue") and map.Value == "Gilded Skies"
+                and started and started:IsA("BoolValue") and dungeon
+                and (dungeon:IsA("Folder") or dungeon:IsA("Model"))) then
+                return resetStartReady("waiting for dungeon data")
+            end
+            if started.Value == true then
+                return resetStartReady("run already started")
+            end
+            if config.startWhenLoaded == false then
+                startGuard.readyState = nil
+                return true
+            end
+            local data = localPlayer:FindFirstChild("dataLoaded")
+            if not (data and data:IsA("BoolValue") and data.Value == true) then
+                return resetStartReady("waiting for player data to load")
+            end
+            local character = localPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if not (character and character:IsDescendantOf(contextWorkspace)
+                and humanoid and root and root:IsA("BasePart")) then
+                return resetStartReady("waiting for the character to load")
+            end
+            local health, maxHealth = humanoid.Health, humanoid.MaxHealth
+            if not (health > 0 and health < math.huge and maxHealth > 0 and maxHealth < math.huge
+                and health <= maxHealth) then
+                return resetStartReady("waiting for health to load")
+            end
+            local state = startGuard.readyState
+            if not state or state.job ~= game.JobId or state.character ~= character
+                or state.humanoid ~= humanoid or state.root ~= root or state.map ~= map
+                or state.started ~= started or state.dungeon ~= dungeon or state.maxHealth ~= maxHealth then
+                state = { job = game.JobId, character = character, humanoid = humanoid, root = root,
+                    map = map, started = started, dungeon = dungeon, maxHealth = maxHealth, at = now }
+                startGuard.readyState = state
+            end
+            if now - state.at < 3 then
+                return false, "waiting for character and health to settle (3s)"
+            end
+            return true
+        end
+        startGuard.sendLobbyStart = function(remote)
+            if not remote or not startGuard.canQueue() then return false end
+            return pcall(remote.FireServer, remote)
+        end
+        startGuard.pressDungeonStart = function(remote, now)
+            if not remote or not startGuard.dungeonReady(now) then return false end
+            return pcall(remote.FireServer, remote)
+        end
+        -- END RAUMA START GUARD
+
         local function R()
             local dungeon = contextWorkspace:FindFirstChild("dungeon")
             local q = dungeon and (dungeon:FindFirstChild("bossRoom"))
@@ -77769,6 +77851,10 @@ end
             return q ~= nil and tostring(q.Value) == "bossKilled"
         end
         local function contextQueueNow(reason)
+            if not startGuard.canQueue() then
+                h("waiting for the lobby before queueing")
+                return false
+            end
             if context.AF and context.AF.soloQueueBlocked and context.AF.soloQueueBlocked() then
                 h("queued by your party")
                 return false
@@ -77794,7 +77880,7 @@ end
                     local w = J and J:FindFirstChild("queueGui") and J.queueGui:FindFirstChild("lobbyInfo")
                     if w and w.Visible then
                         h("party open; starting")
-                        U:FireServer()
+                        if not startGuard.sendLobbyStart(U) then return end
                         return
                     end
                     h(
@@ -77815,6 +77901,7 @@ end
                             "Northern Lands only runs on Insane or Nightmare; difficulty set to Nightmare"
                         )
                     end
+                    if not startGuard.canQueue() then return end
                     J = j:InvokeServer(
                         config.autoQueueMap,
                         config.autoQueueDifficulty,
@@ -77833,7 +77920,7 @@ end
                     end
                     task.wait(config.autoQueueStartDelay)
                     h("starting")
-                    U:FireServer()
+                    if not startGuard.sendLobbyStart(U) then return end
                     contextLog(
                         "Queue",
                         ("queued %s on %s (%s)"):format(
@@ -78031,10 +78118,10 @@ end
             return V
         end
         local function contextLobbyTick(j)
-            if not lB.place or lB.place == "?" or j - lB.placeAt > 5 then
-                lB.place = u()
-                lB.placeAt = j
-            end
+            lB.place, lB.placeAt = u(), j
+
+
+
             if context.AF then
                 pcall(context.AF.tickAlways, j)
             end
@@ -78045,6 +78132,7 @@ end
             local farmEnabled = lB.place == "Level"
                 or lB.place == "100+"
                 or lB.place ~= "Lobby" and u ~= nil and u:IsA("StringValue") and u.Value ~= ""
+            local startReady, startHold = startGuard.dungeonReady(j)
             if
                 config.autoFarmByPlace
                 and lB.place ~= lB.farmAppliedFor
@@ -78123,14 +78211,15 @@ end
                     J
                     and not J.Value
                     and not w
+                    and startReady
                     and (v or (Y or n) and f)
                     and j - lB.levelArrivedAt >= config.autoStartDelay
                     and j - lB.lastStartPress >= 10
                 then
-                    lB.lastStartPress = j
+
                     Z = m("changeStartValue")
-                    if Z then
-                        pcall(Z.FireServer, Z)
+                    if Z and startGuard.pressDungeonStart(Z, j) then
+                        lB.lastStartPress = j
                         contextLog("Queue", "START pressed (" .. tostring(lB.startWhy) .. ")")
                         if context.notify then
                             context.notify(
@@ -78278,7 +78367,7 @@ end
                     lB.replayFired = false
                     lB.finishedSeenAt = nil
                     lB.runOverAt = nil
-                    h("in a run")
+                    h(startHold and startHold ~= "run already started" and startHold or "in a run")
                     return
                 end
                 lB.runOverAt = lB.runOverAt or j
@@ -80517,6 +80606,11 @@ end
             partyQueue.lobbySince = nil
         end
         partyQueue.carryTick = function(S)
+            if not startGuard.canQueue() then
+                p("waiting for the lobby before queueing")
+                partyQueue.restartWait()
+                return
+            end
             if partyQueue.relayEnabled and not partyQueue.relayCanHost() then
                 return
             end
@@ -80724,6 +80818,7 @@ end
                         and (not partyQueue.relayCanHost() or partyQueue.relay.snapshot.epoch ~= relayEpoch) then
                         return
                     end
+                    if not startGuard.canQueue() then return end
                     local success, res = pcall(A.InvokeServer, A, map, diff, req, hardcore, true, false)
                     if context.queueLog then
                         context.queueLog("create_result", {
@@ -80813,7 +80908,7 @@ end
                     return
                 end
             end
-            partyQueue.lastStart = S
+
             n = m("startDungeon")
             if context.queueLog then
                 U = r:FindFirstChild("mapName")
@@ -80822,9 +80917,13 @@ end
                     missing = #u,
                 })
             end
-            if n then
-                pcall(n.FireServer, n)
+            if not startGuard.sendLobbyStart(n) then
+                p("waiting for the lobby before starting the party")
+                return
             end
+            partyQueue.lastStart = S
+
+
             p(#u == 0 and "everyone is in - starting" or ("starting without %s"):format(table.concat(u, ", ")))
             if
                 (#u > 0 or #w > 0 or #j > 0)
@@ -104658,6 +104757,8 @@ end
                         10
                     )
                 )
+                y(LF.content, "Wait for dungeon & health", "startWhenLoaded", 3,
+                    "Start the fight only after entering Gilded Skies, player data and the character have loaded, and maximum health has stayed stable for 3 seconds. Does not require full HP. This account only; lobby queueing stays available.")
 
 
 
